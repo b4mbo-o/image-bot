@@ -535,6 +535,8 @@ def main() -> None:
         for url, created_at in image_items:
             if url in seen_urls or url in page_seen:
                 continue
+            page_seen.add(url)
+            seen_urls.add(url)
             if max_age_cutoff:
                 if created_at is None:
                     logging.info("Skip image with unknown date (strict mode): %s", url)
@@ -546,8 +548,6 @@ def main() -> None:
                         logging.info("Skip old image (%s): %s", dt.date(), url)
                     continue
             new_items.append((url, created_at))
-            page_seen.add(url)
-            seen_urls.add(url)
         if not new_items:
             logging.info("No unseen images for %s; stopping.", label)
             return False
