@@ -1,85 +1,153 @@
-# 画像投稿 BOT & 画像スクレイパー
+# 🤖 Image Bot & Scraper
 
-画像を自動投稿するTwitter BOTと、Yahoo!リアルタイム検索から画像を集めるスクレイパーのセット。直近履歴を避けて回し、基準顔にマッチしたものだけ保存します。
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue?style=for-the-badge&logo=python&logoColor=white)
+![Status](https://img.shields.io/badge/Status-Active-success?style=for-the-badge)
 
-## セットアップ
+画像を自動投稿する **Twitter (X) Bot** と、Yahoo!リアルタイム検索から特定の画像を収集・選別する **スクレイパー** のオールインワンツールセットです。
+
+直近の投稿履歴を回避する重複防止機能や、顔認識によるスマートな画像フィルタリング機能を搭載しています。
+
+---
+
+## 📖 目次
+
+- [✨ 特徴](#-特徴)
+- [📂 ディレクトリ構成](#-ディレクトリ構成)
+- [🚀 セットアップ](#-セットアップ)
+- [🤖 使い方: 画像投稿 BOT](#-使い方-画像投稿-bot)
+- [📷 使い方: 画像スクレイパー](#-使い方-画像スクレイパー)
+- [⏰ 自動実行 (Cron)](#-自動実行-cron)
+- [⚠️ 注意事項](#-注意事項)
+
+---
+
+## ✨ 特徴
+
+### 🐦 画像投稿 BOT
+- **スマートな投稿**: 指定ディレクトリから画像をランダムに選択し投稿。直近の履歴（デフォルト12件）と重複する画像は避けます。
+- **柔軟なスケジュール**: 単発実行はもちろん、ループ実行やCronでの定期実行に対応。
+- **ドライラン機能**: 実際に投稿せずに動作確認が可能。
+
+### 🔍 画像スクレイパー
+- **顔認識フィルタ**: `face_recognition` を使用し、基準となる顔画像（`MEGAFON_noka/`等）と一致する写真のみを保存します。
+- **集合写真の除外**: 3人以上の集合写真は自動的にスキップし、ピンショットやツーショットのみを厳選。
+- **高度な重複排除**: 完全一致だけでなく、p-hashを用いた近似画像の重複も排除します。
+
+---
+
+## 📂 ディレクトリ構成
+
+```text
+.
+├── bot.py             # 画像投稿BOT 本体
+├── scraper.py         # 画像スクレイパー 本体
+├── requirements.txt   # 依存ライブラリ一覧
+├── .env               # 環境変数設定ファイル（要作成）
+├── images/            # 投稿用画像ディレクトリ（.jpg, .png, .webp等）
+├── MEGAFON_noka/      # スクレイピング時の基準顔画像ディレクトリ
+├── logs/              # ログ出力先
+└── state/
+    └── history.json   # 投稿履歴データ
+```
+
+---
+
+## 🚀 セットアップ
+
+### 1. リポジトリのクローンと仮想環境の作成
 
 ```bash
+# リポジトリをクローン（必要であれば）
+git clone [https://github.com/b4mbo-o/image-bot.git](https://github.com/b4mbo-o/image-bot.git)
+cd image-bot
+
+# 仮想環境の作成と有効化
 python3 -m venv .venv
 source .venv/bin/activate
+
+# 依存ライブラリのインストール
 pip install -r requirements.txt
 ```
 
-Twitter APIキーは環境変数か`.env`で指定できます（`.env`があれば自動で読み込みます）。
+> **Note**: スクレイパーを使用する場合、`dlib` のビルドに必要なライブラリがシステムに入っている必要があります。
+> 例 (Ubuntu): `sudo apt-get install -y build-essential cmake libopenblas-dev liblapack-dev libjpeg-dev`
 
-`.env`例:
-```bash
-TWITTER_CONSUMER_KEY=...
-TWITTER_CONSUMER_SECRET=...
-TWITTER_ACCESS_TOKEN=...
-TWITTER_ACCESS_TOKEN_SECRET=...
-```
-`.env`を使わない場合は環境変数でセットしてください。
+### 2. 環境変数の設定
 
-画像は`images/`以下（`.jpg/.jpeg/.png/.gif/.webp`）に配置してください。
+プロジェクトルートに `.env` ファイルを作成し、Twitter APIキーを設定してください。
 
-## 使い方（投稿BOT）
-
-- 単発で投稿: `python bot.py`
-- 4時間ごとに常駐実行: `python bot.py --loop --interval-hours 4`
-- テキスト付き: `python bot.py --text "コメント"`
-- ドライラン（投稿せず選択のみ確認）: `python bot.py --dry-run`
-オプション:
-- `--env-file`: `.env`の場所を変える場合に指定
-- `--log-file`: ログをファイルに出したい場合に指定
-
-履歴の保持件数は`--history-size`で変更できます（デフォルト12）。
-
-## cronで回す例（推奨）
-
-`crontab -e`で以下を追加すると4時間おきに1投稿します。
-
-```
-0 */4 * * * cd /root/image-bot && /root/image-bot/.venv/bin/python bot.py --images-dir /root/image-bot/images --history-file /root/image-bot/state/history.json --log-file /root/image-bot/logs/cron.log >> /root/image-bot/logs/cron.log 2>&1
+```ini
+TWITTER_CONSUMER_KEY=your_consumer_key
+TWITTER_CONSUMER_SECRET=your_consumer_secret
+TWITTER_ACCESS_TOKEN=your_access_token
+TWITTER_ACCESS_TOKEN_SECRET=your_access_token_secret
 ```
 
-`logs/`ディレクトリは自動作成されないので、必要なら事前に`mkdir -p /root/image-bot/logs`を実行してください。
+### 3. 画像の準備
 
-## Yahoo!リアルタイム検索から画像を収集するスクレイパー
+投稿したい画像は `images/` ディレクトリに配置してください。
 
-`scraper.py`はYahoo!リアルタイム検索の結果ページを読み込み、`MEGAFON_noka/`（基準顔）にある画像と一致する写真のみ保存します。顔が3人以上いる集合写真は弾きます（ツーショまでは許可）。デフォルトで `https://search.yahoo.co.jp/realtime/search?p=ID%3AMEGAFON_noka&aq=-1&ei=UTF-8&mtype=image&rkf=1` と `https://search.yahoo.co.jp/realtime/search?p=ID%3AMEGAFON_idol&aq=-1&ei=UTF-8&mtype=image&rkf=1` から取得します。処理の最初に、`images/`内の完全重複（同一バイト列）を除外します。ページ内に新規画像が見つからなくなったら、そのソースの取得を終了します。ベストツイート枠（`id="bt"`）とタイムライン両方の画像を取得します。
-デフォルトは精度重視（tolerance 0.38, オレンジ救済なし）で、実行日から3日前までの投稿のみ対象にします。重複除外は完全一致（同一バイト列）＋近似重複（p-hash）もチェックします。
+---
 
-依存の`face_recognition`を使うため、初回はdlibビルド用のライブラリが必要です（例: `sudo apt-get install -y build-essential cmake libopenblas-dev liblapack-dev libjpeg-dev`）。
+## 🤖 使い方: 画像投稿 BOT
 
-実行例:
+基本的なコマンド一覧です。
+
+| 動作 | コマンド |
+| --- | --- |
+| **単発投稿** | `python bot.py` |
+| **テキスト付き投稿** | `python bot.py --text "おはようございます"` |
+| **常駐実行 (4時間毎)** | `python bot.py --loop --interval-hours 4` |
+| **ドライラン (テスト)** | `python bot.py --dry-run` |
+
+### オプション引数
+- `--env-file`: `.env` の場所を変更する場合に指定。
+- `--log-file`: ログをファイルに出力する場合に指定。
+- `--history-size`: 履歴の保持件数を変更（デフォルト: 12）。
+
+---
+
+## 📷 使い方: 画像スクレイパー
+
+Yahoo!リアルタイム検索から画像を収集し、顔認識でフィルタリングして保存します。
+
+### 基本的な実行
 
 ```bash
 # 基準顔: MEGAFON_noka/、デフォルトURLから直近3日分だけ取得
 python scraper.py --out-dir images --reference-dir MEGAFON_noka --log-file logs/scrape.log
-
-# 取得元を変えたい場合（URLを並べて指定）
-python scraper.py --urls https://search.yahoo.co.jp/realtime/search?p=ID%3AMEGAFON_noka\&aq=-1\&ei=UTF-8\&mtype=image\&rkf=1
-
-# 追加オプション例
-#   --num-jitters 3            # 顔エンコードをより厳密に（やや遅くなる）
-#   --max-age-days 0           # 日付フィルタを無効化（全期間を対象にする）
-#   --html-file get.html       # 保存済みHTMLを解析してダウンロード（ネットでページ取得しない）
-#   --base-url https://search.yahoo.co.jp # --html-file時の相対URL基点（必要な場合のみ）
 ```
 
-### 週1 cron 例
+### 主なオプション
 
+| オプション | 説明 |
+| --- | --- |
+| `--urls` | 取得元のYahoo検索URLを指定（複数指定可） |
+| `--num-jitters` | 顔エンコードの試行回数。数値を上げると厳密になるが遅くなる（例: 3） |
+| `--max-age-days` | 取得対象の日数。`0` を指定すると全期間対象 |
+| `--html-file` | 保存済みHTMLファイルを解析してダウンロード（ローカル解析用） |
+
+---
+
+## ⏰ 自動実行 (Cron)
+
+サーバー等で定期実行する場合の設定例です。
+※事前に `mkdir -p logs` 等でログディレクトリを作成してください。
+
+### 投稿BOT (4時間ごとに実行)
+```cron
+0 */4 * * * cd /path/to/image-bot && /path/to/image-bot/.venv/bin/python bot.py --images-dir ./images --history-file ./state/history.json --log-file ./logs/cron.log >> ./logs/cron.log 2>&1
 ```
-0 3 * * 0 cd /root/image-bot && /root/image-bot/.venv/bin/python scraper.py --log-file /root/image-bot/logs/scrape.log >> /root/image-bot/logs/scrape.log 2>&1
+
+### スクレイパー (毎週日曜 AM3:00 に実行)
+```cron
+0 3 * * 0 cd /path/to/image-bot && /path/to/image-bot/.venv/bin/python scraper.py --log-file ./logs/scrape.log >> ./logs/scrape.log 2>&1
 ```
 
-注意:
-- 既存`images/`に顔が検出できない場合は保存されません（既存画像が基準データ）。
-- 写真タイプ判定は1〜2人の顔が写っているものに限定します。2人写っていても基準顔と一致しない場合は保存しません。
-- 同一ハッシュの画像は保存しません。
+---
 
-## 補足
+## ⚠️ 注意事項
 
-- 画像が直近履歴と全て重複している場合のみ再利用します。
-- 履歴ファイルのロックを行うので、同時起動しても履歴が壊れにくくなっています。
+- **スクレイパーの基準画像**: `images/` ディレクトリ（または `--reference-dir`）に基準となる顔画像がない場合、顔検出機能が正しく動作しません。
+- **写真判定**: スクレイパーは「1〜2人の顔が写っている」かつ「基準顔と一致する」画像のみを保存します。
+- **履歴管理**: 履歴ファイルはロック処理が行われるため、同時起動しても破損しにくい設計になっています。
