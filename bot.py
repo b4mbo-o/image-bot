@@ -9,7 +9,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Dict, Iterable, List, Sequence
 
 import tweepy
 
@@ -17,6 +17,7 @@ import tweepy
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 DEFAULT_HISTORY_SIZE = 12
 DEFAULT_ENV_FILE = ".env"
+DEFAULT_USAGE_FILE = "state/usage.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +39,23 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_HISTORY_SIZE,
         help="How many recent images to keep out of rotation.",
+    )
+    parser.add_argument(
+        "--usage-file",
+        default=DEFAULT_USAGE_FILE,
+        help="Path to store per-image usage counts.",
+    )
+    parser.add_argument(
+        "--prefer-rare",
+        action="store_true",
+        default=True,
+        help="Prefer rarely used images when selecting (default: on).",
+    )
+    parser.add_argument(
+        "--no-prefer-rare",
+        dest="prefer_rare",
+        action="store_false",
+        help="Disable preference for rarely used images.",
     )
     parser.add_argument(
         "--interval-hours",
@@ -143,6 +161,27 @@ def load_history(path: Path) -> List[str]:
         raise RuntimeError(f"Could not parse history file {path}: {exc}") from exc
 
 
+def load_usage(path: Path) -> Dict[str, Dict[str, float]]:
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        raise ValueError("usage file is malformed")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Could not parse usage file {path}: {exc}") from exc
+
+
+def save_usage(path: Path, usage: Dict[str, Dict[str, float]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(usage, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
 def save_history(path: Path, history: Sequence[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -163,7 +202,11 @@ def list_images(images_dir: Path) -> List[Path]:
 
 
 def select_image(
-    images: Sequence[Path], recent: Sequence[str], history_size: int
+    images: Sequence[Path],
+    recent: Sequence[str],
+    history_size: int,
+    usage: Dict[str, Dict[str, float]],
+    prefer_rare: bool,
 ) -> Path:
     if not images:
         raise RuntimeError("No images found to post.")
@@ -178,7 +221,15 @@ def select_image(
         )
         eligible = list(images)
 
-    chosen = random.choice(eligible)
+    pool = eligible
+    if prefer_rare and usage:
+        min_count = min(usage.get(p.name, {}).get("count", 0) for p in eligible)
+        rare = [p for p in eligible if usage.get(p.name, {}).get("count", 0) == min_count]
+        if rare:
+            pool = rare
+            logging.info("Prefer rare images: choosing among %d least-used.", len(pool))
+
+    chosen = random.choice(pool)
     return chosen
 
 
@@ -206,13 +257,15 @@ def run_once(args: argparse.Namespace) -> None:
     load_env(Path(args.env_file))
     images_dir = Path(args.images_dir)
     history_file = Path(args.history_file)
+    usage_file = Path(args.usage_file)
     lock_file = history_file.with_suffix(history_file.suffix + ".lock")
 
     with file_lock(lock_file):
         history = load_history(history_file)
+        usage = load_usage(usage_file)
         images = list_images(images_dir)
         logging.info("Images available in %s: %d", images_dir, len(images))
-        chosen = select_image(images, history, args.history_size)
+        chosen = select_image(images, history, args.history_size, usage, args.prefer_rare)
         rel_name = chosen.relative_to(images_dir).as_posix()
 
         logging.info("Selected image: %s", rel_name)
@@ -229,6 +282,14 @@ def run_once(args: argparse.Namespace) -> None:
         trimmed = history[-args.history_size :]
         save_history(history_file, trimmed)
         logging.info("History updated; %d entries retained.", len(trimmed))
+
+        now_ts = time.time()
+        usage_entry = usage.get(rel_name) or {"count": 0, "last_used": 0}
+        usage_entry["count"] = usage_entry.get("count", 0) + 1
+        usage_entry["last_used"] = now_ts
+        usage[rel_name] = usage_entry
+        save_usage(usage_file, usage)
+        logging.info("Usage updated; count=%d for %s", usage_entry["count"], rel_name)
 
 
 def main() -> None:
