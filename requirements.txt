@@ -1,0 +1,5 @@
+tweepy
+requests
+beautifulsoup4
+face_recognition
+Pillow
