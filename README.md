@@ -16,7 +16,8 @@
 - [🚀 セットアップ](#-セットアップ)
 - [🤖 使い方: 画像投稿 BOT](#-使い方-画像投稿-bot)
 - [📷 使い方: 画像スクレイパー](#-使い方-画像スクレイパー)
-- [⏰ 自動実行 (Cron)](#-自動実行-cron)
+- [☁️ GitHub Actions 運用](#-github-actions-運用)
+- [⏰ ローカル/サーバーでの自動実行](#-ローカルサーバーでの自動実行)
 - [⚠️ 注意事項](#-注意事項)
 
 ---
@@ -97,7 +98,7 @@ TWITTER_ACCESS_TOKEN_SECRET=your_access_token_secret
 | --- | --- |
 | **単発投稿** | `python bot.py` |
 | **テキスト付き投稿** | `python bot.py --text "おはようございます"` |
-| **常駐実行 (4時間毎)** | `python bot.py --loop --interval-hours 4` |
+| **常駐実行 (任意間隔)** | `python bot.py --loop --interval-hours 4` |
 | **ドライラン (テスト)** | `python bot.py --dry-run` |
 
 ### オプション引数
@@ -129,19 +130,34 @@ python scraper.py --out-dir images --reference-dir MEGAFON_noka --log-file logs/
 
 ---
 
-## ⏰ 自動実行 (Cron)
+## ☁️ GitHub Actions 運用
 
-サーバー等で定期実行する場合の設定例です。
-※事前に `mkdir -p logs` 等でログディレクトリを作成してください。
+- スケジュール: JST 00 / 06 / 08 / 12 / 16 / 20（UTC 15 / 21 / 23 / 03 / 07 / 11）
+- 内容: `scraper.py` → `bot.py` を1ジョブで実行し、`images/`, `state/history.json`, `state/usage.json` の差分を自動コミット＆push（PR時はコミットしない）。
+- 必須シークレット（リポや環境「.env」に設定）
+  - `TWITTER_CONSUMER_KEY`
+  - `TWITTER_CONSUMER_SECRET`
+  - `TWITTER_ACCESS_TOKEN`
+  - `TWITTER_ACCESS_TOKEN_SECRET`
+  - 任意: `SAUCENAO_KEY`（逆引きAlt用）
+- ログ: `logs/` を Artifact として保存。
 
-### 投稿BOT (4時間ごとに実行)
+※ Actionsで画像もリポにコミットされるため、リポサイズ増に注意。
+
+---
+
+## ⏰ ローカル/サーバーでの自動実行
+
+ローカルやVPSで回す場合の例（systemdタイマーは現在停止中。必要なら以下を参考に再設定してください）。
+
+### 投稿BOT (例: 4時間ごと)
 ```cron
 0 */4 * * * cd /path/to/image-bot && /path/to/image-bot/.venv/bin/python bot.py --images-dir ./images --history-file ./state/history.json --log-file ./logs/cron.log >> ./logs/cron.log 2>&1
 ```
 
-### スクレイパー (毎週日曜 AM3:00 に実行)
+### スクレイパー (例: 毎日 AM3:00)
 ```cron
-0 3 * * 0 cd /path/to/image-bot && /path/to/image-bot/.venv/bin/python scraper.py --log-file ./logs/scrape.log >> ./logs/scrape.log 2>&1
+0 3 * * * cd /path/to/image-bot && /path/to/image-bot/.venv/bin/python scraper.py --log-file ./logs/scrape.log >> ./logs/scrape.log 2>&1
 ```
 
 ---
