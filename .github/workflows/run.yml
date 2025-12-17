@@ -39,11 +39,14 @@ jobs:
           SAUCENAO_KEY: ${{ secrets.SAUCENAO_KEY }}
         run: |
           mkdir -p logs state images
+          : > logs/bot.log
           python scraper.py --out-dir images --reference-dir MEGAFON_noka --log-file logs/scrape.log
           if [ -z "$TWITTER_CONSUMER_KEY" ] || [ -z "$TWITTER_CONSUMER_SECRET" ] || [ -z "$TWITTER_ACCESS_TOKEN" ] || [ -z "$TWITTER_ACCESS_TOKEN_SECRET" ]; then
-            echo "Missing Twitter secrets; skipping bot."
+            echo "Missing Twitter secrets; skipping bot." | tee -a logs/bot.log
+            exit 0
           elif [ -z "$(find images -maxdepth 1 -type f \( -name '*.jpg' -o -name '*.jpeg' -o -name '*.png' -o -name '*.gif' -o -name '*.webp' \) )" ]; then
-            echo "No images found; skipping bot."
+            echo "No images found; skipping bot." | tee -a logs/bot.log
+            exit 0
           else
             python bot.py --images-dir images --history-file state/history.json --usage-file state/usage.json --log-file logs/bot.log --search-alt
           fi
