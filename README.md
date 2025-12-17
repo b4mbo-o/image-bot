@@ -14,6 +14,7 @@
 - [✨ 特徴](#-特徴)
 - [📂 ディレクトリ構成](#-ディレクトリ構成)
 - [🚀 セットアップ](#-セットアップ)
+- [🔖 ブランチと配布物](#-ブランチと配布物)
 - [🤖 使い方: 画像投稿 BOT](#-使い方-画像投稿-bot)
 - [📷 使い方: 画像スクレイパー](#-使い方-画像スクレイパー)
 - [☁️ GitHub Actions 運用](#-github-actions-運用)
@@ -87,6 +88,14 @@ TWITTER_ACCESS_TOKEN_SECRET=your_access_token_secret
 ### 3. 画像の準備
 
 投稿したい画像は `images/` ディレクトリに配置してください。
+
+---
+
+## 🔖 ブランチと配布物
+
+- `main`: もともとの全データ入りブランチ。
+- `dev`: Bot/Scraperのコードと必要最低限のファイルのみ（画像・基準顔は空、`state/` は空ファイル）。
+- `release-minimal.zip`: `bot.py`, `scraper.py`, `requirements.txt`, `README.md`, `.github/workflows/run.yml`, `.gitignore`, `state/` の最小セットをまとめた配布用ZIP。
 
 ---
 
