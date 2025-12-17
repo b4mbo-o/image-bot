@@ -147,7 +147,7 @@ def build_twitter_clients():
 
 
 def load_history(path: Path) -> List[str]:
-    if not path.exists():
+    if not path.exists() or path.stat().st_size == 0:
         return []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -157,12 +157,13 @@ def load_history(path: Path) -> List[str]:
         if not isinstance(data, list):
             raise ValueError("history file is malformed")
         return [str(item) for item in data]
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Could not parse history file {path}: {exc}") from exc
+    except json.JSONDecodeError:
+        logging.warning("History file is empty or invalid JSON; resetting: %s", path)
+        return []
 
 
 def load_usage(path: Path) -> Dict[str, Dict[str, float]]:
-    if not path.exists():
+    if not path.exists() or path.stat().st_size == 0:
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -170,8 +171,9 @@ def load_usage(path: Path) -> Dict[str, Dict[str, float]]:
         if isinstance(data, dict):
             return data
         raise ValueError("usage file is malformed")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Could not parse usage file {path}: {exc}") from exc
+    except json.JSONDecodeError:
+        logging.warning("Usage file is empty or invalid JSON; resetting: %s", path)
+        return {}
 
 
 def save_usage(path: Path, usage: Dict[str, Dict[str, float]]) -> None:
