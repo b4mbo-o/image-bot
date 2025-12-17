@@ -619,8 +619,8 @@ def main() -> None:
 
     for source_url in args.urls:
         relaxed = "MEGAFON_noka" in source_url or "MEGAFON_idol" in source_url
-        tol = 0.45 if relaxed else 0.34
-        enforce_two_faces = False if relaxed else True
+        tol = 0.45 if relaxed else 0.40  # relaxed sources allow looser match
+        enforce_two_faces = False if relaxed else True  # others must be exact two-shot
         parsed = urlparse(source_url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
         cursor: Optional[str] = None
