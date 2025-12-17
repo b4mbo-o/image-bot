@@ -15,6 +15,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -50,6 +52,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ -z "$GITHUB_TOKEN" ]; then
+            echo "GITHUB_TOKEN is empty; skip commit."
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           mkdir -p state
@@ -60,7 +66,7 @@ jobs:
             exit 0
           fi
           git commit -m "chore: update data ($(date -u +%Y-%m-%d))"
-          git push origin HEAD:${GITHUB_REF_NAME}
+          git push https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git HEAD:${GITHUB_REF_NAME}
       - name: Upload logs (always)
         if: always()
         uses: actions/upload-artifact@v4
