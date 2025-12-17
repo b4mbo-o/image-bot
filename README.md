@@ -29,6 +29,7 @@
 - **スマートな投稿**: 指定ディレクトリから画像をランダムに選択し投稿。直近の履歴（デフォルト12件）と重複する画像は避けます。
 - **柔軟なスケジュール**: 単発実行はもちろん、ループ実行やCronでの定期実行に対応。
 - **ドライラン機能**: 実際に投稿せずに動作確認が可能。
+- **メディアはリポに含めない**: `images/` と `MEGAFON_noka/` は `.gitignore` 済み。必要なら手元やActionsで用意する。
 
 ### 🔍 画像スクレイパー
 - **顔認識フィルタ**: `face_recognition` を使用し、基準となる顔画像（`MEGAFON_noka/`等）と一致する写真のみを保存します。
@@ -87,7 +88,7 @@ TWITTER_ACCESS_TOKEN_SECRET=your_access_token_secret
 
 ### 3. 画像の準備
 
-投稿したい画像は `images/` ディレクトリに配置してください。
+投稿したい画像は `images/` ディレクトリに配置してください（リポには含めない運用です）。
 
 ---
 
@@ -144,11 +145,11 @@ python scraper.py --out-dir images --reference-dir MEGAFON_noka --log-file logs/
 - スケジュール: JST 00 / 06 / 08 / 12 / 16 / 20（UTC 15 / 21 / 23 / 03 / 07 / 11）
 - 内容: `scraper.py` → `bot.py` を1ジョブで実行し、`images/`, `state/history.json`, `state/usage.json` の差分を自動コミット＆push（PR時はコミットしない）。
 - 必須シークレット（リポや環境「.env」に設定）
-  - `TWITTER_CONSUMER_KEY`
-  - `TWITTER_CONSUMER_SECRET`
-  - `TWITTER_ACCESS_TOKEN`
-  - `TWITTER_ACCESS_TOKEN_SECRET`
-  - 任意: `SAUCENAO_KEY`（逆引きAlt用）
+- `TWITTER_CONSUMER_KEY`
+- `TWITTER_CONSUMER_SECRET`
+- `TWITTER_ACCESS_TOKEN`
+- `TWITTER_ACCESS_TOKEN_SECRET`
+- 任意: `SAUCENAO_KEY`（逆引きAlt用）
 - ログ: `logs/` を Artifact として保存。
 
 ※ Actionsで画像もリポにコミットされるため、リポサイズ増に注意。
