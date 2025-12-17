@@ -40,7 +40,7 @@ jobs:
           python scraper.py --out-dir images --reference-dir MEGAFON_noka --log-file logs/scrape.log
           if [ -z "$TWITTER_CONSUMER_KEY" ] || [ -z "$TWITTER_CONSUMER_SECRET" ] || [ -z "$TWITTER_ACCESS_TOKEN" ] || [ -z "$TWITTER_ACCESS_TOKEN_SECRET" ]; then
             echo "Missing Twitter secrets; skipping bot."
-          elif [ -z "$(find images -maxdepth 1 -type f \\( -name '*.jpg' -o -name '*.jpeg' -o -name '*.png' -o -name '*.gif' -o -name '*.webp' \\))" ]; then
+          elif [ -z "$(find images -maxdepth 1 -type f \( -name '*.jpg' -o -name '*.jpeg' -o -name '*.png' -o -name '*.gif' -o -name '*.webp' \) )" ]; then
             echo "No images found; skipping bot."
           else
             python bot.py --images-dir images --history-file state/history.json --usage-file state/usage.json --log-file logs/bot.log --search-alt
