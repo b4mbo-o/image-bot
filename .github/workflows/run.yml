@@ -19,7 +19,29 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Initial checkout (shallow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Detect branch (actions or main)
+        id: detect_branch
+        run: |
+          git remote remove origin || true
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --heads origin actions | grep actions >/dev/null; then
+            echo "actions branch found"
+            echo "BRANCH_NAME=actions" >> $GITHUB_ENV
+          else
+            echo "actions branch NOT found, falling back to main"
+            echo "BRANCH_NAME=main" >> $GITHUB_ENV
+          fi
+
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH_NAME }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -70,7 +92,7 @@ jobs:
             exit 0
           fi
           git commit -m "chore: update data ($(date -u +%Y-%m-%d))"
-          git push https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git HEAD:${GITHUB_REF_NAME}
+          git push https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git HEAD:${BRANCH_NAME}
       - name: Upload logs (always)
         if: always()
         uses: actions/upload-artifact@v4
