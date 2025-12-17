@@ -49,7 +49,7 @@ jobs:
             echo "No images found; skipping bot." | tee -a logs/bot.log
             exit 0
           else
-            python bot.py --images-dir images --history-file state/history.json --usage-file state/usage.json --log-file logs/bot.log --search-alt
+            python bot.py --images-dir images --history-file state/history.json --usage-file state/usage.json --log-file logs/bot.log
           fi
       - name: Commit and push state
         if: github.event_name != 'pull_request'
