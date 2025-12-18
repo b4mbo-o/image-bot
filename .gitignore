@@ -4,7 +4,6 @@ logs/
 *.log
 .env
 state/*.lock
-images/*
-!images/.gitkeep
-MEGAFON_noka/*
-!MEGAFON_noka/.gitkeep
+images/
+MEGAFON_noka/
+MEGAFON_other/

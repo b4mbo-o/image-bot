@@ -69,6 +69,11 @@ def parse_args() -> argparse.Namespace:
         help="参照用の顔画像ディレクトリ（基準顔）。",
     )
     parser.add_argument(
+        "--negative-dir",
+        default="MEGAFON_other",
+        help="除外したい顔画像ディレクトリ（NG顔、空なら無効）。",
+    )
+    parser.add_argument(
         "--max-age-days",
         type=int,
         default=3,
@@ -79,6 +84,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.38,
         help="顔マッチの厳しさ（小さいほど厳密。face_recognition標準は0.6）。",
+    )
+    parser.add_argument(
+        "--negative-tolerance",
+        type=float,
+        default=0.38,
+        help="NG顔とみなす距離（これ以下だと弾く、0以下で無効）。",
+    )
+    parser.add_argument(
+        "--negative-margin",
+        type=float,
+        default=0.04,
+        help="NG顔と紛らわしい場合のマージン（best_neg が best_pos + margin より小さい/近いなら弾く）。",
     )
     parser.add_argument(
         "--num-jitters",
@@ -341,6 +358,68 @@ def load_known_encodings(reference_dir: Path, num_jitters: int) -> List:
     return encodings
 
 
+def load_negative_encodings(negative_dir: Path, num_jitters: int) -> List:
+    if not negative_dir or not negative_dir.exists():
+        return []
+    neg_paths = list_images(negative_dir)
+    if not neg_paths:
+        return []
+
+    file_hashes = {}
+    for path in neg_paths:
+        try:
+            data = path.read_bytes()
+            file_hashes[str(path)] = compute_digest(data)
+        except Exception:
+            logging.warning("Failed to hash negative image %s; skipping.", path)
+
+    cache_path = negative_dir / ".encodings_cache.pkl"
+    if cache_path.exists():
+        try:
+            with open(cache_path, "rb") as f:
+                cached = pickle.load(f)
+            if isinstance(cached, dict) and cached.get("file_hashes") == file_hashes:
+                cached_enc = cached.get("encodings") or []
+                if cached_enc:
+                    logging.info(
+                        "Loaded cached negative encodings (%d).", len(cached_enc)
+                    )
+                    return cached_enc
+        except Exception:
+            logging.debug("Failed to load negative encoding cache; rebuilding.", exc_info=True)
+
+    encodings = []
+    for path in neg_paths:
+        try:
+            data = path.read_bytes()
+            image = face_recognition.load_image_file(io.BytesIO(data))
+            locations = face_recognition.face_locations(image)
+            file_enc = face_recognition.face_encodings(
+                image, locations, num_jitters=num_jitters
+            )
+            if file_enc:
+                encodings.extend(file_enc)
+            else:
+                logging.debug("No faces found in %s", path)
+        except Exception:
+            logging.warning("Failed to process negative image %s; skipping.", path)
+
+    if not encodings:
+        logging.info("No negative face encodings found in %s.", negative_dir)
+        return []
+
+    try:
+        with open(cache_path, "wb") as f:
+            pickle.dump({"file_hashes": file_hashes, "encodings": encodings}, f)
+        logging.info(
+            "Loaded %d negative encodings and cached to %s.", len(encodings), cache_path
+        )
+    except Exception:
+        logging.debug("Failed to write negative encoding cache.", exc_info=True)
+        logging.info("Loaded %d negative face encodings.", len(encodings))
+    return encodings
+
+
 def fetch_search_page(
     url: str, cursor: Optional[str], timeout: float, user_agent: str
 ) -> str:
@@ -447,7 +526,10 @@ def determine_extension(data: bytes) -> Optional[str]:
 def filter_image(
     data: bytes,
     known_encodings: Sequence,
+    negative_encodings: Sequence,
     tolerance: float,
+    negative_tolerance: float,
+    negative_margin: float,
     max_faces: int,
     num_jitters: int,
     enforce_two_faces: bool,
@@ -470,11 +552,16 @@ def filter_image(
         logging.info("Rejected: could not encode faces.")
         return False, "encode_fail"
     min_dists = []
+    min_neg_dists = []
     for cand in encodings:
         dists = face_recognition.face_distance(known_encodings, cand)
         if len(dists) == 0:
             continue
         min_dists.append(min(dists))
+        if negative_encodings and negative_tolerance > 0:
+            neg_dists = face_recognition.face_distance(negative_encodings, cand)
+            if len(neg_dists) > 0:
+                min_neg_dists.append(min(neg_dists))
 
     if not min_dists:
         logging.info("Rejected: could not compute face distance.")
@@ -484,6 +571,27 @@ def filter_image(
     if best > tolerance:
         logging.info("Rejected: faces do not match known references (best=%.3f).", best)
         return False, "no_match"
+
+    if min_neg_dists:
+        best_neg = min(min_neg_dists)
+        # Hard reject if it's too close to a negative identity.
+        if negative_tolerance > 0 and best_neg <= negative_tolerance:
+            logging.info(
+                "Rejected: matches negative references (best_neg=%.3f <= %.3f).",
+                best_neg,
+                negative_tolerance,
+            )
+            return False, "negative_match"
+        # Also reject if the negative match is closer than the positive match by a margin.
+        # This helps when multiple similar faces exist in the group.
+        if negative_margin > 0 and best_neg <= best + negative_margin:
+            logging.info(
+                "Rejected: ambiguous vs negative (best=%.3f, best_neg=%.3f, margin=%.3f).",
+                best,
+                best_neg,
+                negative_margin,
+            )
+            return False, "negative_ambiguous"
     return True, "ok"
 
 
@@ -510,6 +618,11 @@ def main() -> None:
         deduplicate_images(ref_dir)
 
     known_encodings = load_known_encodings(ref_dir, args.num_jitters)
+    negative_encodings = (
+        load_negative_encodings(Path(args.negative_dir), args.num_jitters)
+        if args.negative_dir
+        else []
+    )
     existing_hashes = digests_for_existing(out_dir)
     seen_hashes: Set[str] = set(existing_hashes)
 
@@ -576,7 +689,10 @@ def main() -> None:
             ok, reason = filter_image(
                 data,
                 known_encodings,
+                negative_encodings,
                 tolerance,
+                args.negative_tolerance,
+                args.negative_margin,
                 args.max_faces,
                 args.num_jitters,
                 enforce_two_faces,
