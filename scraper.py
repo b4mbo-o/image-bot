@@ -8,6 +8,7 @@ import logging
 import os
 import pickle
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence, Set, Tuple
@@ -69,6 +70,28 @@ def parse_args() -> argparse.Namespace:
         help="参照用の顔画像ディレクトリ（基準顔）。",
     )
     parser.add_argument(
+        "--negative-dir",
+        default="MEGAFON_other",
+        help="除外したい顔画像ディレクトリ（NG顔、空なら無効）。",
+    )
+    parser.add_argument(
+        "--clean-training-dirs",
+        action="store_true",
+        help="reference/negativeディレクトリから顔が取れない画像を削除して整理する。",
+    )
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        default=True,
+        help="学習キャッシュ(.encodings_cache.pkl)を優先して使用する（デフォルトON）。",
+    )
+    parser.add_argument(
+        "--no-cache-only",
+        dest="cache_only",
+        action="store_false",
+        help="キャッシュが古い場合に再計算を許可する。",
+    )
+    parser.add_argument(
         "--max-age-days",
         type=int,
         default=3,
@@ -77,14 +100,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tolerance",
         type=float,
-        default=0.38,
+        default=0.45,
         help="顔マッチの厳しさ（小さいほど厳密。face_recognition標準は0.6）。",
+    )
+    parser.add_argument(
+        "--negative-tolerance",
+        type=float,
+        default=0.35,
+        help="NG顔とみなす距離（これ以下だと弾く、0以下で無効）。",
+    )
+    parser.add_argument(
+        "--negative-margin",
+        type=float,
+        default=0.03,
+        help="NG顔と紛らわしい場合のマージン（best_neg が best_pos + margin より小さい/近いなら弾く）。",
     )
     parser.add_argument(
         "--num-jitters",
         type=int,
         default=3,
         help="顔エンコード時のジッター回数（増やすと精度↑・速度↓）。",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="顔処理に使うプロセス数（未指定なら2、0以下でCPU数）。",
     )
     parser.add_argument(
         "--max-faces",
@@ -286,7 +327,7 @@ def digests_for_existing(images_dir: Path) -> Set[str]:
     return digests
 
 
-def load_known_encodings(reference_dir: Path, num_jitters: int) -> List:
+def load_known_encodings(reference_dir: Path, num_jitters: int, cache_only: bool) -> List:
     ref_paths = list_images(reference_dir)
     file_hashes = {}
     for path in ref_paths:
@@ -301,9 +342,11 @@ def load_known_encodings(reference_dir: Path, num_jitters: int) -> List:
         try:
             with open(cache_path, "rb") as f:
                 cached = pickle.load(f)
-            if isinstance(cached, dict) and cached.get("file_hashes") == file_hashes:
+            if isinstance(cached, dict):
                 cached_enc = cached.get("encodings") or []
-                if cached_enc:
+                if cached_enc and (
+                    cache_only or cached.get("file_hashes") == file_hashes
+                ):
                     logging.info(
                         "Loaded cached reference encodings (%d).", len(cached_enc)
                     )
@@ -312,20 +355,27 @@ def load_known_encodings(reference_dir: Path, num_jitters: int) -> List:
             logging.debug("Failed to load encoding cache; rebuilding.", exc_info=True)
 
     encodings = []
-    for path in ref_paths:
-        try:
-            data = path.read_bytes()
-            image = face_recognition.load_image_file(io.BytesIO(data))
-            locations = face_recognition.face_locations(image)
-            file_enc = face_recognition.face_encodings(
-                image, locations, num_jitters=num_jitters
-            )
-            if file_enc:
-                encodings.extend(file_enc)
-            else:
-                logging.debug("No faces found in %s", path)
-        except Exception:
-            logging.warning("Failed to process reference image %s; skipping.", path)
+    # Parallelize encoding build (up to 3 workers).
+    requested = int(getattr(load_known_encodings, "_workers", 2) or 2)
+    cpu = os.cpu_count() or 1
+    if requested <= 0:
+        requested = cpu
+    max_workers = max(1, min(cpu, requested))
+    if len(ref_paths) == 1:
+        max_workers = 1
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_encode_faces_from_path, str(p), num_jitters) for p in ref_paths]
+        done = 0
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                _, file_enc = fut.result()
+                if file_enc:
+                    encodings.extend(file_enc)
+            except Exception:
+                logging.warning("Failed to process reference image; skipping.", exc_info=True)
+            if done % 50 == 0 or done == len(futures):
+                logging.info("Reference encoding progress: %d/%d", done, len(futures))
     if not encodings:
         raise RuntimeError("No face encodings found in reference images.")
 
@@ -339,6 +389,157 @@ def load_known_encodings(reference_dir: Path, num_jitters: int) -> List:
         logging.debug("Failed to write encoding cache.", exc_info=True)
         logging.info("Loaded %d reference face encodings.", len(encodings))
     return encodings
+
+
+def load_negative_encodings(negative_dir: Path, num_jitters: int, cache_only: bool) -> List:
+    if not negative_dir or not negative_dir.exists():
+        return []
+    neg_paths = list_images(negative_dir)
+    if not neg_paths:
+        return []
+
+    file_hashes = {}
+    for path in neg_paths:
+        try:
+            data = path.read_bytes()
+            file_hashes[str(path)] = compute_digest(data)
+        except Exception:
+            logging.warning("Failed to hash negative image %s; skipping.", path)
+
+    cache_path = negative_dir / ".encodings_cache.pkl"
+    if cache_path.exists():
+        try:
+            with open(cache_path, "rb") as f:
+                cached = pickle.load(f)
+            if isinstance(cached, dict):
+                cached_enc = cached.get("encodings") or []
+                if cached_enc and (
+                    cache_only or cached.get("file_hashes") == file_hashes
+                ):
+                    logging.info(
+                        "Loaded cached negative encodings (%d).", len(cached_enc)
+                    )
+                    return cached_enc
+        except Exception:
+            logging.debug("Failed to load negative encoding cache; rebuilding.", exc_info=True)
+
+    encodings = []
+    requested = int(getattr(load_negative_encodings, "_workers", 2) or 2)
+    cpu = os.cpu_count() or 1
+    if requested <= 0:
+        requested = cpu
+    max_workers = max(1, min(cpu, requested))
+    if len(neg_paths) == 1:
+        max_workers = 1
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = [
+            ex.submit(_encode_faces_from_path_with_count, str(p), num_jitters)
+            for p in neg_paths
+        ]
+        done = 0
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                _, file_enc, _ = fut.result()
+                if file_enc:
+                    encodings.extend(file_enc)
+            except Exception:
+                logging.warning("Failed to process negative image; skipping.", exc_info=True)
+            if done % 100 == 0 or done == len(futures):
+                logging.info("Negative encoding progress: %d/%d", done, len(futures))
+
+    if not encodings:
+        logging.info("No negative face encodings found in %s.", negative_dir)
+        return []
+
+    try:
+        with open(cache_path, "wb") as f:
+            pickle.dump({"file_hashes": file_hashes, "encodings": encodings}, f)
+        logging.info(
+            "Loaded %d negative encodings and cached to %s.", len(encodings), cache_path
+        )
+    except Exception:
+        logging.debug("Failed to write negative encoding cache.", exc_info=True)
+        logging.info("Loaded %d negative face encodings.", len(encodings))
+    return encodings
+
+
+def _clean_face_dir(dir_path: Path, num_jitters: int, label: str) -> int:
+    """
+    Remove files that cannot produce any face encodings.
+    Uses HOG model for speed.
+    """
+    if not dir_path.exists():
+        return 0
+    files = list_images(dir_path)
+    if not files:
+        return 0
+
+    requested = int(getattr(_clean_face_dir, "_workers", 2) or 2)
+    cpu = os.cpu_count() or 1
+    if requested <= 0:
+        requested = cpu
+    max_workers = max(1, min(cpu, requested))
+    if len(files) == 1:
+        max_workers = 1
+
+    removed = 0
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_has_any_face_in_path, str(p)): p for p in files}
+        done = 0
+        for fut in as_completed(futures):
+            done += 1
+            path = futures[fut]
+            ok = False
+            try:
+                ok = fut.result()
+            except Exception:
+                ok = False
+            if not ok:
+                try:
+                    path.unlink()
+                    removed += 1
+                    logging.info("[%s] Removed unusable face image: %s", label, path)
+                except Exception:
+                    logging.warning("[%s] Failed to remove bad image: %s", label, path)
+            if done % 200 == 0 or done == len(files):
+                logging.info("[%s] Clean progress: %d/%d removed=%d", label, done, len(files), removed)
+    if removed:
+        logging.info("[%s] Cleaned %s: removed=%d", label, dir_path, removed)
+    return removed
+
+
+def _encode_faces_from_path(path_str: str, num_jitters: int):
+    """
+    Worker: returns (path, encodings_list).
+    Uses HOG model for CPU speed.
+    """
+    path = Path(path_str)
+    data = path.read_bytes()
+    image = face_recognition.load_image_file(io.BytesIO(data))
+    locations = face_recognition.face_locations(image, model="hog")
+    encodings = face_recognition.face_encodings(image, locations, num_jitters=num_jitters)
+    return path_str, encodings
+
+
+def _encode_faces_from_path_with_count(path_str: str, num_jitters: int):
+    """
+    Worker: returns (path, encodings_list, face_count).
+    """
+    path = Path(path_str)
+    data = path.read_bytes()
+    image = face_recognition.load_image_file(io.BytesIO(data))
+    locations = face_recognition.face_locations(image, model="hog")
+    encodings = face_recognition.face_encodings(image, locations, num_jitters=num_jitters)
+    return path_str, encodings, len(locations)
+
+
+def _has_any_face_in_path(path_str: str) -> bool:
+    path = Path(path_str)
+    data = path.read_bytes()
+    image = face_recognition.load_image_file(io.BytesIO(data))
+    locations = face_recognition.face_locations(image, model="hog")
+    return bool(locations)
 
 
 def fetch_search_page(
@@ -447,7 +648,10 @@ def determine_extension(data: bytes) -> Optional[str]:
 def filter_image(
     data: bytes,
     known_encodings: Sequence,
+    negative_encodings: Sequence,
     tolerance: float,
+    negative_tolerance: float,
+    negative_margin: float,
     max_faces: int,
     num_jitters: int,
     enforce_two_faces: bool,
@@ -470,11 +674,16 @@ def filter_image(
         logging.info("Rejected: could not encode faces.")
         return False, "encode_fail"
     min_dists = []
+    min_neg_dists = []
     for cand in encodings:
         dists = face_recognition.face_distance(known_encodings, cand)
         if len(dists) == 0:
             continue
         min_dists.append(min(dists))
+        if negative_encodings and negative_tolerance > 0:
+            neg_dists = face_recognition.face_distance(negative_encodings, cand)
+            if len(neg_dists) > 0:
+                min_neg_dists.append(min(neg_dists))
 
     if not min_dists:
         logging.info("Rejected: could not compute face distance.")
@@ -484,6 +693,27 @@ def filter_image(
     if best > tolerance:
         logging.info("Rejected: faces do not match known references (best=%.3f).", best)
         return False, "no_match"
+
+    if min_neg_dists:
+        best_neg = min(min_neg_dists)
+        # Hard reject if it's too close to a negative identity.
+        if negative_tolerance > 0 and best_neg <= negative_tolerance:
+            logging.info(
+                "Rejected: matches negative references (best_neg=%.3f <= %.3f).",
+                best_neg,
+                negative_tolerance,
+            )
+            return False, "negative_match"
+        # Also reject if the negative match is closer than the positive match by a margin.
+        # This helps when multiple similar faces exist in the group.
+        if negative_margin > 0 and best_neg <= best + negative_margin:
+            logging.info(
+                "Rejected: ambiguous vs negative (best=%.3f, best_neg=%.3f, margin=%.3f).",
+                best,
+                best_neg,
+                negative_margin,
+            )
+            return False, "negative_ambiguous"
     return True, "ok"
 
 
@@ -503,13 +733,30 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     ref_dir = Path(args.reference_dir)
+    neg_dir = Path(args.negative_dir) if args.negative_dir else None
 
     ensure_out_dir(out_dir)
     deduplicate_images(out_dir)
     if ref_dir != out_dir:
         deduplicate_images(ref_dir)
+    if neg_dir and neg_dir.exists() and neg_dir != out_dir:
+        deduplicate_images(neg_dir)
 
-    known_encodings = load_known_encodings(ref_dir, args.num_jitters)
+    if args.clean_training_dirs:
+        _clean_face_dir(ref_dir, args.num_jitters, "reference")
+        if neg_dir:
+            _clean_face_dir(neg_dir, args.num_jitters, "negative")
+
+    load_known_encodings._workers = args.workers
+    load_negative_encodings._workers = args.workers
+    _clean_face_dir._workers = args.workers
+
+    known_encodings = load_known_encodings(ref_dir, args.num_jitters, args.cache_only)
+    negative_encodings = (
+        load_negative_encodings(neg_dir, args.num_jitters, args.cache_only)
+        if neg_dir
+        else []
+    )
     existing_hashes = digests_for_existing(out_dir)
     seen_hashes: Set[str] = set(existing_hashes)
 
@@ -527,6 +774,8 @@ def main() -> None:
         label: str,
         tolerance: float,
         enforce_two_faces: bool,
+        neg_tol: float,
+        neg_margin: float,
     ) -> bool:
         nonlocal saved
         new_items: List[Tuple[str, Optional[int]]] = []
@@ -576,7 +825,10 @@ def main() -> None:
             ok, reason = filter_image(
                 data,
                 known_encodings,
+                negative_encodings,
                 tolerance,
+                neg_tol,
+                neg_margin,
                 args.max_faces,
                 args.num_jitters,
                 enforce_two_faces,
@@ -612,15 +864,33 @@ def main() -> None:
             image_items,
             args.html_file,
             args.tolerance,
+            args.negative_tolerance,
+            args.negative_margin,
             False,
         )
         logging.info("Finished. Saved %d new images.", saved)
         return
 
     for source_url in args.urls:
-        relaxed = "MEGAFON_noka" in source_url or "MEGAFON_idol" in source_url
-        tol = 0.45 if relaxed else 0.40  # relaxed sources allow looser match
-        enforce_two_faces = False if relaxed else True  # others must be exact two-shot
+        is_noka = "MEGAFON_noka" in source_url
+        is_idol = "MEGAFON_idol" in source_url
+
+        if is_noka:
+            tol = 0.50  # 本人優先で緩め
+            neg_tol = 0.40
+            neg_margin = 0.03
+            enforce_two_faces = False
+        elif is_idol:
+            tol = 0.45
+            neg_tol = 0.32  # ネガティブに近い場合は厳しめ
+            neg_margin = 0.03
+            enforce_two_faces = False
+        else:
+            tol = 0.38  # 他メンバーは厳しめ
+            neg_tol = 0.32
+            neg_margin = 0.02
+            enforce_two_faces = True  # のかとの2ショットのみ許可
+
         parsed = urlparse(source_url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
         cursor: Optional[str] = None
@@ -636,7 +906,9 @@ def main() -> None:
                 break
 
             image_items, next_cursor = extract_image_urls(html, base_url)
-            if not handle_image_items(image_items, source_url, tol, enforce_two_faces):
+            if not handle_image_items(
+                image_items, source_url, tol, neg_tol, neg_margin, enforce_two_faces
+            ):
                 break
 
             if not next_cursor:
