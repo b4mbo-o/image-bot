@@ -775,11 +775,13 @@ def detect_faces_robust(
     # 4. CNN Fallback (if not used initially and memory allows)
     if model != "cnn":
         try:
-            # CNNはメモリ食うので、あまり大きくない画像で試す
+            # CNNはメモリ食うが、精度優先でサイズ制限を緩和 (800 -> 1200)
             img_cnn = pil_img
-            if max(orig_w, orig_h) > 800:
-                scale = 800 / max(orig_w, orig_h)
-                img_cnn = pil_img.resize((int(orig_w*scale), int(orig_h*scale)), Image.LANCZOS)
+            w, h = pil_img.size
+            max_dim = max(w, h)
+            if max_dim > 1200:
+                scale = 1200.0 / max_dim
+                img_cnn = pil_img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
             
             arr_cnn = np.array(img_cnn)
             locs = face_recognition.face_locations(arr_cnn, model="cnn", number_of_times_to_upsample=0)
@@ -812,77 +814,187 @@ def filter_image(
     # ロバストな顔検出を実行
     locations, image_array, method = detect_faces_robust(pil_img, FACE_MODEL, detect_upsample)
 
-    if not locations:
-        logging.debug("Rejected: no face detected.")
-        return False, "no_face"
-    
-    if len(locations) > max_faces:
-        logging.debug("Rejected: %d faces detected (max %d).", len(locations), max_faces)
-        return False, "too_many_faces"
-    
-    if enforce_two_faces and len(locations) != 2:
-        logging.debug("Rejected: require exact two faces, found %d.", len(locations))
-        return False, "too_many_faces"
+    # -------------------------------------------------------------------------
+    # 【追加】ツーショット（複数顔）検出時のCNNスイッチ
+    # HOGでちょうど2人検出された場合のみ、精度向上のためCNNで再検出を行う
+    # -------------------------------------------------------------------------
+    if FACE_MODEL == "hog" and len(locations) == 2:
+        logging.debug("HOG found 2 faces. Switching to CNN for better accuracy...")
+        try:
+            # CNNはメモリ消費が激しいので、画像が大きすぎる場合は縮小する
+            h, w = image_array.shape[:2]
+            max_dim = max(h, w)
+            cnn_input = image_array
+            scale_factor = 1.0
+            
+            if max_dim > 1200: # 精度優先で1200pxまで許容
+                scale_factor = 1200.0 / max_dim
+                new_w = int(w * scale_factor)
+                new_h = int(h * scale_factor)
+                # PIL経由でリサイズ
+                cnn_input = np.array(Image.fromarray(image_array).resize((new_w, new_h), Image.LANCZOS))
+                logging.debug("Resized for CNN: %dx%d -> %dx%d", w, h, new_w, new_h)
 
-    try:
-        encodings = face_recognition.face_encodings(
-            image_array, locations, num_jitters=num_jitters
-        )
-    except Exception:
-        logging.debug("Rejected: error during encoding.")
-        return False, "encode_fail"
+            cnn_locs = face_recognition.face_locations(cnn_input, model="cnn", number_of_times_to_upsample=0)
+            
+            if cnn_locs:
+                # リサイズしていた場合は座標を元に戻す
+                if scale_factor != 1.0:
+                    scaled_locs = []
+                    for (top, right, bottom, left) in cnn_locs:
+                        scaled_locs.append((
+                            int(top / scale_factor),
+                            int(right / scale_factor),
+                            int(bottom / scale_factor),
+                            int(left / scale_factor)
+                        ))
+                    locations = scaled_locs
+                else:
+                    locations = cnn_locs
+                
+                method += "+cnn_switch"
+                logging.debug("CNN switch successful. Found %d faces.", len(locations))
+            else:
+                logging.debug("CNN found no faces. Keeping HOG results.")
+        except Exception as e:
+            logging.debug("CNN switch failed (err=%s). Keeping HOG results.", e)
 
-    if not encodings:
-        logging.debug("Rejected: could not encode faces.")
-        return False, "encode_fail"
-
-    min_dists = []
-    min_neg_dists = []
-    
-    # 認識ロジック
-    for cand in encodings:
-        dists = face_recognition.face_distance(known_encodings, cand)
-        if len(dists) == 0:
-            continue
-        min_dists.append(min(dists))
+    # --- 内部関数: 顔の検証ロジック ---
+    def validate_faces(current_locs, current_img, encs=None):
+        if not current_locs:
+            return False, "no_face", False # needs_retry
         
-        if negative_encodings and negative_tolerance > 0:
-            neg_dists = face_recognition.face_distance(negative_encodings, cand)
-            if len(neg_dists) > 0:
-                min_neg_dists.append(min(neg_dists))
+        if len(current_locs) > max_faces:
+            return False, "too_many_faces", False
+        
+        if enforce_two_faces and len(current_locs) != 2:
+            return False, "too_many_faces", False
 
-    if not min_dists:
-        logging.debug("Rejected: could not compute face distance.")
-        return False, "encode_fail"
+        if encs is None:
+            try:
+                encs = face_recognition.face_encodings(
+                    current_img, current_locs, num_jitters=num_jitters
+                )
+            except Exception:
+                return False, "encode_fail", False
 
-    best = min(min_dists)
-    
-    # ログ出力（デバッグ用）
-    logging.debug("Match Score: %.4f (Method: %s)", best, method)
+        if not encs:
+            return False, "encode_fail", False
 
-    if best > tolerance:
-        logging.debug("Rejected: best match %.3f > tolerance %.3f", best, tolerance)
-        return False, "no_match"
+        has_valid_face = False
+        retry_candidate = False # 惜しい（本人判定だがNGに近い）場合にTrue
+        
+        global_best_score = float('inf')
+        global_best_neg = float('inf')
+        
+        # 本人スコアがこれ以下なら、Negative判定を無視して強制採用する閾値
+        STRONG_MATCH_THRESHOLD = 0.27
+        STRONG_MATCH_NEG_DIFF = 0.04
 
-    if min_neg_dists:
-        best_neg = min(min_neg_dists)
-        if negative_tolerance > 0 and best_neg <= negative_tolerance:
-            logging.debug(
-                "Rejected: matches negative references (best_neg=%.3f <= %.3f).",
-                best_neg,
-                negative_tolerance,
-            )
-            return False, "negative_match"
-        if negative_margin > 0 and best_neg <= best + negative_margin:
-            logging.debug(
-                "Rejected: ambiguous vs negative (best=%.3f, best_neg=%.3f, margin=%.3f).",
-                best,
-                best_neg,
-                negative_margin,
-            )
-            return False, "negative_ambiguous"
+        for cand in encs:
+            dists = face_recognition.face_distance(known_encodings, cand)
+            if len(dists) == 0: continue
+            score = min(dists)
+            global_best_score = min(global_best_score, score)
 
-    return True, "ok"
+            neg_score = float('inf')
+            if negative_encodings:
+                neg_dists = face_recognition.face_distance(negative_encodings, cand)
+                if len(neg_dists) > 0:
+                    neg_score = min(neg_dists)
+                global_best_neg = min(global_best_neg, neg_score)
+
+            # A. 本人似ではない -> スキップ
+            if score > tolerance:
+                continue
+
+            # 特例: 本人スコアが非常に良い場合は即採用 (Strong Match)
+            if score <= STRONG_MATCH_THRESHOLD:
+                 if negative_encodings and neg_score < (score - STRONG_MATCH_NEG_DIFF):
+                     logging.debug("Rejected Strong Match: closer to negative (score=%.3f, neg=%.3f)", score, neg_score)
+                     retry_candidate = True # 怪しいのでCNNで再検査したい
+                 else:
+                     logging.debug("Found valid face (Strong Match): score=%.3f", score)
+                     has_valid_face = True
+                     break
+            
+            # B. 本人似だが、Negativeチェック
+            is_negative = False
+            if negative_tolerance > 0 and neg_score <= negative_tolerance:
+                if score < neg_score - negative_margin:
+                    pass 
+                else:
+                    is_negative = True
+            
+            if neg_score < score:
+                is_negative = True
+
+            if not is_negative:
+                logging.debug("Found valid face: score=%.3f, neg=%.3f", score, neg_score)
+                has_valid_face = True
+                break
+            else:
+                # 本人圏内に入っているのにNegative判定された -> 惜しいので再検査候補
+                retry_candidate = True
+
+        if has_valid_face:
+            return True, "ok", False
+        
+        if global_best_score > tolerance:
+            logging.debug("Rejected: best match %.3f > tolerance %.3f", global_best_score, tolerance)
+            return False, "no_match", False
+        else:
+            logging.debug("Rejected: ambiguous or negative match (score=%.3f, neg=%.3f)", global_best_score, global_best_neg)
+            return False, "negative_match", retry_candidate
+
+    # --- 1回目の検証 (HOG / Initial CNN) ---
+    ok, reason, needs_retry = validate_faces(locations, image_array)
+    if ok:
+        return True, reason
+
+    # --- 2回目の検証 (セカンドオピニオン) ---
+    # HOGで「惜しい」判定だった場合、CNNで再挑戦する
+    if needs_retry and "cnn" not in method and FACE_MODEL == "hog":
+        logging.debug("HOG results ambiguous (potential match rejected). Retrying with CNN...")
+        try:
+            h, w = image_array.shape[:2]
+            max_dim = max(h, w)
+            cnn_input = image_array
+            scale_factor = 1.0
+            
+            if max_dim > 1200:
+                scale_factor = 1200.0 / max_dim
+                new_w = int(w * scale_factor)
+                new_h = int(h * scale_factor)
+                cnn_input = np.array(Image.fromarray(image_array).resize((new_w, new_h), Image.LANCZOS))
+            
+            cnn_locs = face_recognition.face_locations(cnn_input, model="cnn", number_of_times_to_upsample=0)
+            
+            if cnn_locs:
+                if scale_factor != 1.0:
+                    scaled_locs = []
+                    for (t, r, b, l) in cnn_locs:
+                        scaled_locs.append((
+                            int(t/scale_factor), int(r/scale_factor), int(b/scale_factor), int(l/scale_factor)
+                        ))
+                    locations = scaled_locs
+                else:
+                    locations = cnn_locs
+                
+                # 再検証
+                ok_retry, reason_retry, _ = validate_faces(locations, image_array)
+                if ok_retry:
+                    logging.debug("CNN retry successful!")
+                    return True, "ok"
+                else:
+                    logging.debug("CNN retry result: %s", reason_retry)
+                    return False, reason_retry
+            else:
+                logging.debug("CNN found no faces during retry.")
+        except Exception as e:
+            logging.debug("CNN retry crashed: %s", e)
+
+    return False, reason
 
 
 def download_image(url: str, timeout: float, user_agent: str) -> bytes:
@@ -1081,9 +1193,10 @@ def main() -> None:
             source_label = "その他"
             tol = base_tolerance # 標準
             neg_tol = base_neg_tol
-            neg_margin = args.negative_margin
+            # ツーショット（その他）の場合は、救済措置を効かせるためマージンを少し小さめに
+            neg_margin = 0.02 
             max_faces = 2
-            enforce_two_faces = False
+            enforce_two_faces = True
 
         parsed = urlparse(source_url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
