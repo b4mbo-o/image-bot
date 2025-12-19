@@ -11,7 +11,7 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import List, Optional, Sequence, Set, Tuple, Dict, Any
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import face_recognition
@@ -805,11 +805,11 @@ def filter_image(
     num_jitters: int,
     enforce_two_faces: bool,
     detect_upsample: int,
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, Dict[str, Any]]:
     try:
         pil_img = Image.fromarray(face_recognition.load_image_file(io.BytesIO(data))).convert("RGB")
     except Exception:
-        return False, "load_error"
+        return False, "load_error", {}
 
     # ロバストな顔検出を実行
     locations, image_array, method = detect_faces_robust(pil_img, FACE_MODEL, detect_upsample)
@@ -817,6 +817,7 @@ def filter_image(
     # -------------------------------------------------------------------------
     # 【追加】ツーショット（複数顔）検出時のCNNスイッチ
     # HOGでちょうど2人検出された場合のみ、精度向上のためCNNで再検出を行う
+    # 3人以上はmax_facesで弾かれる前提なのでリソース節約のためスキップ
     # -------------------------------------------------------------------------
     if FACE_MODEL == "hog" and len(locations) == 2:
         logging.debug("HOG found 2 faces. Switching to CNN for better accuracy...")
@@ -827,7 +828,7 @@ def filter_image(
             cnn_input = image_array
             scale_factor = 1.0
             
-            if max_dim > 1200: # 精度優先で1200pxまで許容
+            if max_dim > 1200: # 精度優先で1200pxまで許容 (元1000)
                 scale_factor = 1200.0 / max_dim
                 new_w = int(w * scale_factor)
                 new_h = int(h * scale_factor)
@@ -861,14 +862,15 @@ def filter_image(
 
     # --- 内部関数: 顔の検証ロジック ---
     def validate_faces(current_locs, current_img, encs=None):
+        details = {"score": 9.99, "neg_score": 9.99}
         if not current_locs:
-            return False, "no_face", False # needs_retry
+            return False, "no_face", False, details # needs_retry
         
         if len(current_locs) > max_faces:
-            return False, "too_many_faces", False
+            return False, "too_many_faces", False, details
         
         if enforce_two_faces and len(current_locs) != 2:
-            return False, "too_many_faces", False
+            return False, "too_many_faces", False, details
 
         if encs is None:
             try:
@@ -876,10 +878,10 @@ def filter_image(
                     current_img, current_locs, num_jitters=num_jitters
                 )
             except Exception:
-                return False, "encode_fail", False
+                return False, "encode_fail", False, details
 
         if not encs:
-            return False, "encode_fail", False
+            return False, "encode_fail", False, details
 
         has_valid_face = False
         retry_candidate = False # 惜しい（本人判定だがNGに近い）場合にTrue
@@ -888,6 +890,8 @@ def filter_image(
         global_best_neg = float('inf')
         
         # 本人スコアがこれ以下なら、Negative判定を無視して強制採用する閾値
+        # 0.35だと緩すぎるため、0.30に下げつつ、Negativeとの乖離チェックを追加
+        # 他人が0.281を出して通過してしまったため、さらに厳しく0.27へ
         STRONG_MATCH_THRESHOLD = 0.27
         STRONG_MATCH_NEG_DIFF = 0.04
 
@@ -910,6 +914,7 @@ def filter_image(
 
             # 特例: 本人スコアが非常に良い場合は即採用 (Strong Match)
             if score <= STRONG_MATCH_THRESHOLD:
+                 # Negativeが本人より大幅に良い値(0.04以上差がある)なら、StrongMatchでも弾く
                  if negative_encodings and neg_score < (score - STRONG_MATCH_NEG_DIFF):
                      logging.debug("Rejected Strong Match: closer to negative (score=%.3f, neg=%.3f)", score, neg_score)
                      retry_candidate = True # 怪しいのでCNNで再検査したい
@@ -921,6 +926,8 @@ def filter_image(
             # B. 本人似だが、Negativeチェック
             is_negative = False
             if negative_tolerance > 0 and neg_score <= negative_tolerance:
+                # Negative圏内。本人スコアと比較して救済できるか？
+                # 「本人スコア < Negativeスコア - マージン」なら本人とみなす
                 if score < neg_score - negative_margin:
                     pass 
                 else:
@@ -936,21 +943,24 @@ def filter_image(
             else:
                 # 本人圏内に入っているのにNegative判定された -> 惜しいので再検査候補
                 retry_candidate = True
+        
+        details["score"] = global_best_score
+        details["neg_score"] = global_best_neg
 
         if has_valid_face:
-            return True, "ok", False
+            return True, "ok", False, details
         
         if global_best_score > tolerance:
             logging.debug("Rejected: best match %.3f > tolerance %.3f", global_best_score, tolerance)
-            return False, "no_match", False
+            return False, "no_match", False, details
         else:
             logging.debug("Rejected: ambiguous or negative match (score=%.3f, neg=%.3f)", global_best_score, global_best_neg)
-            return False, "negative_match", retry_candidate
+            return False, "negative_match", retry_candidate, details
 
     # --- 1回目の検証 (HOG / Initial CNN) ---
-    ok, reason, needs_retry = validate_faces(locations, image_array)
+    ok, reason, needs_retry, _ = validate_faces(locations, image_array)
     if ok:
-        return True, reason
+        return True, reason, {}
 
     # --- 2回目の検証 (セカンドオピニオン) ---
     # HOGで「惜しい」判定だった場合、CNNで再挑戦する
@@ -982,19 +992,19 @@ def filter_image(
                     locations = cnn_locs
                 
                 # 再検証
-                ok_retry, reason_retry, _ = validate_faces(locations, image_array)
+                ok_retry, reason_retry, _, _ = validate_faces(locations, image_array)
                 if ok_retry:
                     logging.debug("CNN retry successful!")
-                    return True, "ok"
+                    return True, "ok", {}
                 else:
                     logging.debug("CNN retry result: %s", reason_retry)
-                    return False, reason_retry
+                    return False, reason_retry, {}
             else:
                 logging.debug("CNN found no faces during retry.")
         except Exception as e:
             logging.debug("CNN retry crashed: %s", e)
 
-    return False, reason
+    return False, reason, {}
 
 
 def download_image(url: str, timeout: float, user_agent: str) -> bytes:
@@ -1115,7 +1125,7 @@ def main() -> None:
                 stats["unsupported"] += 1
                 continue
 
-            ok, reason = filter_image(
+            ok, reason, _ = filter_image(
                 data,
                 known_encodings,
                 negative_encodings,
@@ -1178,7 +1188,7 @@ def main() -> None:
             source_label = "のか"
             tol = base_tolerance + 0.05  # 本人はさらに甘く (例: 0.50 -> 0.55)
             neg_tol = 0.0 # NG判定なし
-            neg_margin = 0.0
+            neg_margin = 0.03 # ローカル実験結果反映: 0.0 -> 0.03
             max_faces = 2  # ツーショまで
             enforce_two_faces = False
         elif "MEGAFON_idol" in source_url:
@@ -1190,13 +1200,13 @@ def main() -> None:
             max_faces = 2  # ツーショまで
             enforce_two_faces = False
         else:
-            source_label = "その他"
+            source_label = "その他(ツーショ限定)"
             tol = base_tolerance # 標準
             neg_tol = base_neg_tol
             # ツーショット（その他）の場合は、救済措置を効かせるためマージンを少し小さめに
             neg_margin = 0.02 
             max_faces = 2
-            enforce_two_faces = True
+            enforce_two_faces = True # 修正: 2人写っている場合のみ許可する
 
         parsed = urlparse(source_url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
