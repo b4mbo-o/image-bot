@@ -15,17 +15,19 @@ from typing import List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import face_recognition
+import numpy as np
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image
-from PIL import ImageChops
+from PIL import Image, ImageOps, ImageEnhance
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 FILENAME_PREFIX = "yahoo_rt"
+FACE_MODEL = "hog"
+FACE_UPSAMPLE = 1
 DEFAULT_URLS = [
     "https://search.yahoo.co.jp/realtime/search?p=ID%3AMEGAFON_noka&aq=-1&ei=UTF-8&mtype=image&rkf=1",
     "https://search.yahoo.co.jp/realtime/search?p=ID%3AMEGAFON_idol&aq=-1&ei=UTF-8&mtype=image&rkf=1",
@@ -47,17 +49,17 @@ def parse_args() -> argparse.Namespace:
         "--urls",
         nargs="+",
         default=DEFAULT_URLS,
-        help="Yahoo!リアルタイム検索などのページURL（例: https://search.yahoo.co.jp/...）。",
+        help="Yahoo!リアルタイム検索などのページURL。",
     )
     parser.add_argument(
         "--html-file",
         default="",
-        help="保存済みHTMLファイルを解析してダウンロードする場合のパス（ネット取得なし）。",
+        help="保存済みHTMLファイルを解析してダウンロードする場合のパス。",
     )
     parser.add_argument(
         "--base-url",
         default="",
-        help="--html-file使用時の基点URL（相対リンク解決用、不要なら空でOK）。",
+        help="--html-file使用時の基点URL。",
     )
     parser.add_argument(
         "--out-dir",
@@ -72,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--negative-dir",
         default="MEGAFON_other",
-        help="除外したい顔画像ディレクトリ（NG顔、空なら無効）。",
+        help="除外したい顔画像ディレクトリ（NG顔）。",
     )
     parser.add_argument(
         "--clean-training-dirs",
@@ -83,7 +85,7 @@ def parse_args() -> argparse.Namespace:
         "--cache-only",
         action="store_true",
         default=True,
-        help="学習キャッシュ(.encodings_cache.pkl)を優先して使用する（デフォルトON）。",
+        help="学習キャッシュ(.encodings_cache.pkl)を優先して使用する。",
     )
     parser.add_argument(
         "--no-cache-only",
@@ -94,44 +96,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-age-days",
         type=int,
-        default=3,
-        help="実行日からさかのぼって何日までの投稿を対象にするか（0以下で無効）。",
+        default=4,
+        help="実行日からさかのぼって何日までの投稿を対象にするか。",
     )
     parser.add_argument(
         "--tolerance",
         type=float,
-        default=0.45,
-        help="顔マッチの厳しさ（小さいほど厳密。face_recognition標準は0.6）。",
+        default=0.50, # 変更: デフォルトを0.45から0.50へ緩和
+        help="顔マッチの厳しさ（小さいほど厳密。0.6が標準、0.5推奨）。",
     )
     parser.add_argument(
         "--negative-tolerance",
         type=float,
-        default=0.35,
-        help="NG顔とみなす距離（これ以下だと弾く、0以下で無効）。",
+        default=0.40, # 変更: デフォルトを少し緩和
+        help="NG顔とみなす距離（これ以下だと弾く）。",
     )
     parser.add_argument(
         "--negative-margin",
         type=float,
-        default=0.03,
-        help="NG顔と紛らわしい場合のマージン（best_neg が best_pos + margin より小さい/近いなら弾く）。",
+        default=0.05, # 変更: マージンを少し広げる
+        help="NG顔と紛らわしい場合のマージン。",
     )
     parser.add_argument(
         "--num-jitters",
         type=int,
-        default=3,
-        help="顔エンコード時のジッター回数（増やすと精度↑・速度↓）。",
+        default=5, # 変更: 精度向上のためデフォルトを3から5へ
+        help="顔エンコード時のジッター回数（増やすと精度↑）。",
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=2,
-        help="顔処理に使うプロセス数（未指定なら2、0以下でCPU数）。",
+        help="顔処理に使うプロセス数。",
     )
     parser.add_argument(
         "--max-faces",
         type=int,
-        default=2,
-        help="1枚あたりの許容顔数（多人数写真は除外）。",
+        default=2, # 変更: 写り込みを考慮してデフォルトを2から3へ
+        help="1枚あたりの許容顔数。",
     )
     parser.add_argument(
         "--timeout",
@@ -140,9 +142,26 @@ def parse_args() -> argparse.Namespace:
         help="HTTPタイムアウト秒数。",
     )
     parser.add_argument(
+        "--upsample",
+        type=int,
+        default=1, # 変更: デフォルトを0から1へ（検出率向上）
+        help="顔検出のアップサンプル回数。",
+    )
+    parser.add_argument(
+        "--model",
+        choices=["hog", "cnn"],
+        default="hog",
+        help="顔検出モデル（cnnの方が精度高いがGPU推奨）。",
+    )
+    parser.add_argument(
         "--log-file",
         default="",
-        help="ログファイルパス（指定しないと標準出力のみ）。",
+        help="ログファイルパス。",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="詳細ログを出力する。",
     )
     parser.add_argument(
         "--user-agent",
@@ -152,13 +171,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def setup_logging(log_file: str) -> None:
+def setup_logging(log_file: str, debug: bool) -> None:
     handlers = [logging.StreamHandler()]
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file))
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if debug else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=handlers,
     )
@@ -195,8 +214,6 @@ def deduplicate_images(images_dir: Path) -> None:
             logging.warning("画像の読み込みに失敗しました: %s", path)
 
     to_delete: Set[Path] = set()
-
-    # 完全一致のハッシュで重複排除
     by_digest = {}
     for info in info_list:
         digest = info["digest"]
@@ -238,10 +255,6 @@ def remove_near_duplicates(
     new_files: List[Path],
     phash_threshold: int = 3,
 ) -> int:
-    """
-    Remove newly saved files that are perceptually identical
-    to an existing image (very small hamming distance).
-    """
     if not new_files:
         return 0
 
@@ -276,7 +289,6 @@ TOKYO_TZ = ZoneInfo("Asia/Tokyo")
 
 def parse_time_text(text: str, now: datetime) -> Optional[int]:
     text = text.strip()
-    # "3分前", "2時間前"
     m = re.match(r"(\d+)\s*分前", text)
     if m:
         minutes = int(m.group(1))
@@ -287,7 +299,6 @@ def parse_time_text(text: str, now: datetime) -> Optional[int]:
         hours = int(m.group(1))
         dt = now - timedelta(hours=hours)
         return int(dt.timestamp())
-    # "昨日 22:35" or "今日 08:12"
     m = re.match(r"(昨日|今日)\s*(\d{1,2}):(\d{2})", text)
     if m:
         base = now.date()
@@ -298,7 +309,6 @@ def parse_time_text(text: str, now: datetime) -> Optional[int]:
             hour=hour, minute=minute
         )
         return int(dt.timestamp())
-    # "MM月DD日(...) HH:MM" or "MM月DD日 HH:MM"
     m = re.match(r"(\d{1,2})月(\d{1,2})日.*?(\d{1,2}):(\d{2})", text)
     if m:
         month, day, hour, minute = map(int, m.groups())
@@ -307,7 +317,6 @@ def parse_time_text(text: str, now: datetime) -> Optional[int]:
         if dt > now + timedelta(days=1):
             dt = dt.replace(year=year - 1)
         return int(dt.timestamp())
-    # "YYYY年MM月DD日 HH:MM"
     m = re.match(r"(\d{4})年(\d{1,2})月(\d{1,2})日.*?(\d{1,2}):(\d{2})", text)
     if m:
         year, month, day, hour, minute = map(int, m.groups())
@@ -355,7 +364,6 @@ def load_known_encodings(reference_dir: Path, num_jitters: int, cache_only: bool
             logging.debug("Failed to load encoding cache; rebuilding.", exc_info=True)
 
     encodings = []
-    # Parallelize encoding build (up to 3 workers).
     requested = int(getattr(load_known_encodings, "_workers", 2) or 2)
     cpu = os.cpu_count() or 1
     if requested <= 0:
@@ -465,10 +473,6 @@ def load_negative_encodings(negative_dir: Path, num_jitters: int, cache_only: bo
 
 
 def _clean_face_dir(dir_path: Path, num_jitters: int, label: str) -> int:
-    """
-    Remove files that cannot produce any face encodings.
-    Uses HOG model for speed.
-    """
     if not dir_path.exists():
         return 0
     files = list_images(dir_path)
@@ -510,26 +514,23 @@ def _clean_face_dir(dir_path: Path, num_jitters: int, label: str) -> int:
 
 
 def _encode_faces_from_path(path_str: str, num_jitters: int):
-    """
-    Worker: returns (path, encodings_list).
-    Uses HOG model for CPU speed.
-    """
     path = Path(path_str)
     data = path.read_bytes()
     image = face_recognition.load_image_file(io.BytesIO(data))
-    locations = face_recognition.face_locations(image, model="hog")
+    locations = face_recognition.face_locations(
+        image, model=FACE_MODEL, number_of_times_to_upsample=FACE_UPSAMPLE
+    )
     encodings = face_recognition.face_encodings(image, locations, num_jitters=num_jitters)
     return path_str, encodings
 
 
 def _encode_faces_from_path_with_count(path_str: str, num_jitters: int):
-    """
-    Worker: returns (path, encodings_list, face_count).
-    """
     path = Path(path_str)
     data = path.read_bytes()
     image = face_recognition.load_image_file(io.BytesIO(data))
-    locations = face_recognition.face_locations(image, model="hog")
+    locations = face_recognition.face_locations(
+        image, model=FACE_MODEL, number_of_times_to_upsample=FACE_UPSAMPLE
+    )
     encodings = face_recognition.face_encodings(image, locations, num_jitters=num_jitters)
     return path_str, encodings, len(locations)
 
@@ -538,7 +539,9 @@ def _has_any_face_in_path(path_str: str) -> bool:
     path = Path(path_str)
     data = path.read_bytes()
     image = face_recognition.load_image_file(io.BytesIO(data))
-    locations = face_recognition.face_locations(image, model="hog")
+    locations = face_recognition.face_locations(
+        image, model=FACE_MODEL, number_of_times_to_upsample=FACE_UPSAMPLE
+    )
     return bool(locations)
 
 
@@ -556,6 +559,30 @@ def fetch_search_page(
 def extract_image_urls(
     html: str, base_url: str
 ) -> Tuple[List[Tuple[str, Optional[int]]], Optional[str]]:
+    def _collect_media_from_container(container) -> List[str]:
+        found: List[str] = []
+        if not container:
+            return found
+        for img in container.find_all("img"):
+            src = img.get("src")
+            if src:
+                found.append(src)
+        for div in container.find_all(style=True):
+            style = div.get("style", "")
+            if "background-image" not in style:
+                continue
+            bg_url = _extract_background_url(style)
+            if bg_url:
+                found.append(bg_url)
+        return found
+
+    def _extract_background_url(style_value: str) -> Optional[str]:
+        match = re.search(r"background-image:\s*url\(([^)]+)\)", style_value)
+        if not match:
+            return None
+        raw = match.group(1).strip().strip("\"'")
+        return raw or None
+
     def media_urls_from_entry(entry: dict) -> List[Tuple[str, Optional[int]]]:
         urls: List[Tuple[str, Optional[int]]] = []
         created_at = entry.get("createdAt")
@@ -595,7 +622,6 @@ def extract_image_urls(
                 if isinstance(entry, dict):
                     urls.extend(media_urls_from_entry(entry))
             if urls:
-                # Yahoo!リアルタイム検索にはcursorが無いのでここで返す
                 return urls, None
         except Exception:
             logging.warning(
@@ -603,26 +629,57 @@ def extract_image_urls(
                 exc_info=True,
             )
 
-    time_values: List[Optional[int]] = []
-    for t in soup.find_all("time"):
-        parsed = parse_time_text(t.get_text(strip=True), now_jst)
-        if parsed:
-            time_values.append(parsed)
-    time_idx = 0
+    tweet_containers = soup.find_all(
+        "div", class_=lambda c: c and "Tweet_TweetContainer" in c
+    )
+    if tweet_containers:
+        for container in tweet_containers:
+            ts: Optional[int] = None
+            time_tag = container.find("time")
+            if time_tag:
+                ts = parse_time_text(time_tag.get_text(strip=True), now_jst)
+            for src in _collect_media_from_container(container):
+                urls.append((urljoin(base_url, src), ts))
+    else:
+        time_values: List[Optional[int]] = []
+        for t in soup.find_all("time"):
+            parsed = parse_time_text(t.get_text(strip=True), now_jst)
+            if parsed:
+                time_values.append(parsed)
+        time_idx = 0
 
-    for a in soup.find_all("a", class_=lambda c: c and "still-image" in c):
-        href = a.get("href")
-        if href:
+        for a in soup.find_all("a", class_=lambda c: c and "still-image" in c):
+            href = a.get("href")
+            if href:
+                ts = time_values[time_idx] if time_idx < len(time_values) else None
+                time_idx += 1
+                urls.append((urljoin(base_url, href), ts))
+
+        for img in soup.find_all("img"):
+            src = img.get("src")
+            if not src:
+                continue
+            if img.get("data-test") == "image" or (
+                img.parent and "Tweet_imageContainer" in (img.parent.get("class") or [])
+            ):
+                ts = time_values[time_idx] if time_idx < len(time_values) else None
+                time_idx += 1
+                urls.append((urljoin(base_url, src), ts))
+            elif "/pic/" in src:
+                ts = time_values[time_idx] if time_idx < len(time_values) else None
+                time_idx += 1
+                urls.append((urljoin(base_url, src), ts))
+
+        for div in soup.find_all(style=True):
+            style = div.get("style", "")
+            if "background-image" not in style:
+                continue
+            bg_url = _extract_background_url(style)
+            if not bg_url:
+                continue
             ts = time_values[time_idx] if time_idx < len(time_values) else None
             time_idx += 1
-            urls.append((urljoin(base_url, href), ts))
-
-    for img in soup.find_all("img"):
-        src = img.get("src")
-        if src and "/pic/" in src:
-            ts = time_values[time_idx] if time_idx < len(time_values) else None
-            time_idx += 1
-            urls.append((urljoin(base_url, src), ts))
+            urls.append((urljoin(base_url, bg_url), ts))
 
     next_cursor = None
     more_link = soup.find("a", href=lambda h: h and "cursor=" in h)
@@ -632,6 +689,15 @@ def extract_image_urls(
         qs = parse_qs(parsed.query)
         if "cursor" in qs and qs["cursor"]:
             next_cursor = qs["cursor"][0]
+
+    bt_container = soup.find("div", id="bt")
+    if bt_container:
+        bt_ts = None
+        bt_time = bt_container.find("time")
+        if bt_time:
+            bt_ts = parse_time_text(bt_time.get_text(strip=True), now_jst)
+        for src in _collect_media_from_container(bt_container):
+            urls.append((urljoin(base_url, src), bt_ts))
 
     return urls, next_cursor
 
@@ -645,6 +711,87 @@ def determine_extension(data: bytes) -> Optional[str]:
     return None
 
 
+def detect_faces_robust(
+    pil_img: Image.Image,
+    model: str,
+    base_upsample: int,
+) -> Tuple[List, np.ndarray, str]:
+    """
+    複数の前処理を試して顔検出を行う。
+    Returns: (locations, numpy_image, method_name)
+    """
+    # 1. Standard approach with AutoContrast
+    img_std = ImageOps.autocontrast(pil_img)
+    arr_std = np.array(img_std)
+    
+    # リサイズ戦略: 小さすぎる画像は大きくする
+    orig_w, orig_h = pil_img.size
+    min_dim = min(orig_w, orig_h)
+    
+    # 通常のアップサンプル設定
+    upsample = base_upsample
+    if min_dim < 400:
+        upsample += 1
+    
+    try:
+        locs = face_recognition.face_locations(arr_std, model=model, number_of_times_to_upsample=upsample)
+        if locs:
+            return locs, arr_std, "std"
+    except MemoryError:
+        pass
+
+    # 2. Histogram Equalization (for dark/backlit images)
+    try:
+        img_eq = ImageOps.equalize(pil_img)
+        arr_eq = np.array(img_eq)
+        locs = face_recognition.face_locations(arr_eq, model=model, number_of_times_to_upsample=upsample)
+        if locs:
+            logging.debug("Faces found via Histogram Equalization.")
+            return locs, arr_eq, "equalize"
+    except Exception:
+        pass
+
+    # 3. Aggressive Upscale (最後の手段)
+    # すでに標準で試しているので、ここではさらに大きくして試す
+    if min_dim < 800:
+        target_min = 1000
+        scale = target_min / float(min_dim)
+        new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+        try:
+            img_big = pil_img.resize((new_w, new_h), Image.LANCZOS)
+            # コントラストも強調
+            enhancer = ImageEnhance.Contrast(img_big)
+            img_big = enhancer.enhance(1.5)
+            arr_big = np.array(img_big)
+            
+            # 画像が大きいのでupsampleは0か1で良い
+            locs = face_recognition.face_locations(arr_big, model=model, number_of_times_to_upsample=1)
+            if locs:
+                logging.debug("Faces found via Aggressive Upscale.")
+                return locs, arr_big, "upscale"
+        except Exception:
+            pass
+            
+    # 4. CNN Fallback (if not used initially and memory allows)
+    if model != "cnn":
+        try:
+            # CNNはメモリ食うので、あまり大きくない画像で試す
+            img_cnn = pil_img
+            if max(orig_w, orig_h) > 800:
+                scale = 800 / max(orig_w, orig_h)
+                img_cnn = pil_img.resize((int(orig_w*scale), int(orig_h*scale)), Image.LANCZOS)
+            
+            arr_cnn = np.array(img_cnn)
+            locs = face_recognition.face_locations(arr_cnn, model="cnn", number_of_times_to_upsample=0)
+            if locs:
+                logging.debug("Faces found via CNN fallback.")
+                return locs, arr_cnn, "cnn_fallback"
+        except Exception:
+            pass
+
+    return [], arr_std, "failed"
+
+
 def filter_image(
     data: bytes,
     known_encodings: Sequence,
@@ -655,65 +802,86 @@ def filter_image(
     max_faces: int,
     num_jitters: int,
     enforce_two_faces: bool,
+    detect_upsample: int,
 ) -> Tuple[bool, str]:
-    image = face_recognition.load_image_file(io.BytesIO(data))
-    locations = face_recognition.face_locations(image)
+    try:
+        pil_img = Image.fromarray(face_recognition.load_image_file(io.BytesIO(data))).convert("RGB")
+    except Exception:
+        return False, "load_error"
+
+    # ロバストな顔検出を実行
+    locations, image_array, method = detect_faces_robust(pil_img, FACE_MODEL, detect_upsample)
+
     if not locations:
-        logging.info("Rejected: no face detected.")
+        logging.debug("Rejected: no face detected.")
         return False, "no_face"
+    
     if len(locations) > max_faces:
-        logging.info("Rejected: %d faces detected (max %d).", len(locations), max_faces)
+        logging.debug("Rejected: %d faces detected (max %d).", len(locations), max_faces)
         return False, "too_many_faces"
+    
     if enforce_two_faces and len(locations) != 2:
-        logging.info("Rejected: require exact two faces, found %d.", len(locations))
+        logging.debug("Rejected: require exact two faces, found %d.", len(locations))
         return False, "too_many_faces"
-    encodings = face_recognition.face_encodings(
-        image, locations, num_jitters=num_jitters
-    )
-    if not encodings:
-        logging.info("Rejected: could not encode faces.")
+
+    try:
+        encodings = face_recognition.face_encodings(
+            image_array, locations, num_jitters=num_jitters
+        )
+    except Exception:
+        logging.debug("Rejected: error during encoding.")
         return False, "encode_fail"
+
+    if not encodings:
+        logging.debug("Rejected: could not encode faces.")
+        return False, "encode_fail"
+
     min_dists = []
     min_neg_dists = []
+    
+    # 認識ロジック
     for cand in encodings:
         dists = face_recognition.face_distance(known_encodings, cand)
         if len(dists) == 0:
             continue
         min_dists.append(min(dists))
+        
         if negative_encodings and negative_tolerance > 0:
             neg_dists = face_recognition.face_distance(negative_encodings, cand)
             if len(neg_dists) > 0:
                 min_neg_dists.append(min(neg_dists))
 
     if not min_dists:
-        logging.info("Rejected: could not compute face distance.")
+        logging.debug("Rejected: could not compute face distance.")
         return False, "encode_fail"
 
     best = min(min_dists)
+    
+    # ログ出力（デバッグ用）
+    logging.debug("Match Score: %.4f (Method: %s)", best, method)
+
     if best > tolerance:
-        logging.info("Rejected: faces do not match known references (best=%.3f).", best)
+        logging.debug("Rejected: best match %.3f > tolerance %.3f", best, tolerance)
         return False, "no_match"
 
     if min_neg_dists:
         best_neg = min(min_neg_dists)
-        # Hard reject if it's too close to a negative identity.
         if negative_tolerance > 0 and best_neg <= negative_tolerance:
-            logging.info(
+            logging.debug(
                 "Rejected: matches negative references (best_neg=%.3f <= %.3f).",
                 best_neg,
                 negative_tolerance,
             )
             return False, "negative_match"
-        # Also reject if the negative match is closer than the positive match by a margin.
-        # This helps when multiple similar faces exist in the group.
         if negative_margin > 0 and best_neg <= best + negative_margin:
-            logging.info(
+            logging.debug(
                 "Rejected: ambiguous vs negative (best=%.3f, best_neg=%.3f, margin=%.3f).",
                 best,
                 best_neg,
                 negative_margin,
             )
             return False, "negative_ambiguous"
+
     return True, "ok"
 
 
@@ -729,7 +897,10 @@ def ensure_out_dir(out_dir: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    setup_logging(args.log_file)
+    setup_logging(args.log_file, args.debug)
+    global FACE_UPSAMPLE, FACE_MODEL
+    FACE_UPSAMPLE = max(0, int(args.upsample))
+    FACE_MODEL = args.model
 
     out_dir = Path(args.out_dir)
     ref_dir = Path(args.reference_dir)
@@ -773,11 +944,17 @@ def main() -> None:
         image_items: List[Tuple[str, Optional[int]]],
         label: str,
         tolerance: float,
-        enforce_two_faces: bool,
         neg_tol: float,
         neg_margin: float,
+        max_faces: int,
+        enforce_two_faces: bool,
     ) -> bool:
         nonlocal saved
+        # 検出用アップサンプル数の自動調整
+        detect_upsample = FACE_UPSAMPLE
+        if "のか" in label:
+            detect_upsample = max(detect_upsample, 1) # 最低でも1回はアップサンプル
+
         new_items: List[Tuple[str, Optional[int]]] = []
         page_seen: Set[str] = set()
         hit_old = 0
@@ -788,20 +965,24 @@ def main() -> None:
             seen_urls.add(url)
             if max_age_cutoff:
                 if created_at is None:
-                    logging.info("Skip image with unknown date (strict mode): %s", url)
-                    continue
-                dt = datetime.fromtimestamp(created_at, tz=timezone.utc)
-                if dt < max_age_cutoff:
-                    hit_old += 1
-                    if hit_old <= 3:
-                        logging.info("Skip old image (%s): %s", dt.date(), url)
-                    continue
+                    # 日付不明でも一旦許可（厳しすぎると取りこぼすため）
+                    pass
+                else:
+                    dt = datetime.fromtimestamp(created_at, tz=timezone.utc)
+                    if dt < max_age_cutoff:
+                        hit_old += 1
+                        if hit_old <= 3:
+                            logging.debug("Skip old image (%s): %s", dt.date(), url)
+                        continue
             new_items.append((url, created_at))
+        
         if not new_items:
-            logging.info("No unseen images for %s; stopping.", label)
+            logging.debug("No unseen images for %s; stopping.", label)
             return False
 
-        for url, _ in new_items:
+        total = len(new_items)
+        for idx, (url, _) in enumerate(new_items, 1):
+            logging.debug("Processing %s image %d/%d: %s", label, idx, total, url)
             try:
                 data = download_image(url, args.timeout, args.user_agent)
             except Exception:
@@ -811,14 +992,14 @@ def main() -> None:
 
             digest = compute_digest(data)
             if digest in seen_hashes:
-                logging.info("Skip duplicate (hash match): %s", url)
+                logging.debug("Skip duplicate (hash match): %s", url)
                 stats["duplicate_hash"] += 1
                 continue
             seen_hashes.add(digest)
 
             ext = determine_extension(data)
             if not ext or f".{ext.lstrip('.')}" not in IMAGE_EXTS:
-                logging.info("Rejected: unsupported image type from %s", url)
+                logging.debug("Rejected: unsupported image type from %s", url)
                 stats["unsupported"] += 1
                 continue
 
@@ -829,9 +1010,10 @@ def main() -> None:
                 tolerance,
                 neg_tol,
                 neg_margin,
-                args.max_faces,
+                max_faces,
                 args.num_jitters,
                 enforce_two_faces,
+                detect_upsample,
             )
             if not ok:
                 stats[reason] += 1
@@ -844,10 +1026,13 @@ def main() -> None:
             existing_hashes.add(digest)
             saved += 1
             stats["saved"] += 1
-            logging.info("Saved %s (total saved: %d)", save_path, saved)
+            logging.info("判定OK [%s] -> %s", label, save_path)
             new_saved_files.append(save_path)
-        if hit_old >= 3:
-            logging.info("Encountered multiple old images for %s; stopping further pages.", label)
+        
+        if hit_old >= 5: # 古い画像が5枚続いたら停止（バッファを持たせる）
+            logging.debug(
+                "Encountered multiple old images for %s; stopping further pages.", label
+            )
             return False
         return True
 
@@ -859,42 +1044,51 @@ def main() -> None:
             return
         base_url = args.base_url or ""
         image_items, _ = extract_image_urls(html, base_url)
-        # HTML取得時はURL名でモードを決められないので厳しめ（tolerance same, enforce_two_faces=False）
         handle_image_items(
             image_items,
-            args.html_file,
+            "html",
             args.tolerance,
             args.negative_tolerance,
             args.negative_margin,
+            args.max_faces,
             False,
         )
         logging.info("Finished. Saved %d new images.", saved)
         return
 
     for source_url in args.urls:
-        is_noka = "MEGAFON_noka" in source_url
-        is_idol = "MEGAFON_idol" in source_url
-
-        if is_noka:
-            tol = 0.50  # 本人優先で緩め
-            neg_tol = 0.40
-            neg_margin = 0.03
+        # NOTE: 以前のハードコードされた値を緩和し、CLI引数を尊重するように変更
+        # 本人の基準値（少し甘め）
+        base_tolerance = args.tolerance
+        base_neg_tol = args.negative_tolerance
+        
+        if "MEGAFON_noka" in source_url:
+            source_label = "のか"
+            tol = base_tolerance + 0.05  # 本人はさらに甘く (例: 0.50 -> 0.55)
+            neg_tol = 0.0 # NG判定なし
+            neg_margin = 0.0
+            max_faces = 2  # ツーショまで
             enforce_two_faces = False
-        elif is_idol:
-            tol = 0.45
-            neg_tol = 0.32  # ネガティブに近い場合は厳しめ
-            neg_margin = 0.03
+        elif "MEGAFON_idol" in source_url:
+            source_label = "のか(公式)"
+            # 公式は少し厳しめ＋ネガティブも併用して誤検知を減らす
+            tol = base_tolerance + 0.02  # 本人より少し甘い程度
+            neg_tol = 0.23              # ネガティブ基準を有効にする
+            neg_margin = 0.02           # ベストとの差が小さいときは弾く
+            max_faces = 2  # ツーショまで
             enforce_two_faces = False
         else:
-            tol = 0.38  # 他メンバーは厳しめ
-            neg_tol = 0.32
-            neg_margin = 0.02
-            enforce_two_faces = True  # のかとの2ショットのみ許可
+            source_label = "その他"
+            tol = base_tolerance # 標準
+            neg_tol = base_neg_tol
+            neg_margin = args.negative_margin
+            max_faces = 2
+            enforce_two_faces = False
 
         parsed = urlparse(source_url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
         cursor: Optional[str] = None
-        logging.info("Scraping %s", source_url)
+        logging.info("Scraping %s (tol=%.2f)", source_url, tol)
 
         while True:
             try:
@@ -907,7 +1101,13 @@ def main() -> None:
 
             image_items, next_cursor = extract_image_urls(html, base_url)
             if not handle_image_items(
-                image_items, source_url, tol, neg_tol, neg_margin, enforce_two_faces
+                image_items,
+                source_label,
+                tol,
+                neg_tol,
+                neg_margin,
+                max_faces,
+                enforce_two_faces,
             ):
                 break
 
