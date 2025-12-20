@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-age-days",
         type=int,
-        default=4,
+        default=2,
         help="実行日からさかのぼって何日までの投稿を対象にするか。",
     )
     parser.add_argument(
