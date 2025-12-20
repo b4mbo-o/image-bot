@@ -32,6 +32,7 @@
 
 ### 🔍 画像スクレイパー
 - **顔認識フィルタ**: `face_recognition` を使用し、基準となる顔画像（`MEGAFON_noka/`等）と一致する写真のみを保存します。
+- **ロバスト検出**: 明るさ補正/リサイズ/アップサンプルを複数試し、ツーショット時はCNN再判定も行うことで検出漏れを減らします。
 - **集合写真の除外**: 3人以上の集合写真は自動的にスキップし、ピンショットやツーショットのみを厳選。
 - **高度な重複排除**: 完全一致だけでなく、p-hashを用いた近似画像の重複も排除します。
 
@@ -124,7 +125,7 @@ Yahoo!リアルタイム検索から画像を収集し、顔認識でフィル�
 ### 基本的な実行
 
 ```bash
-# 基準顔: MEGAFON_noka/、デフォルトURLから直近3日分だけ取得
+# 基準顔: MEGAFON_noka/、デフォルトURLから直近2日分だけ取得
 python scraper.py --out-dir images --reference-dir MEGAFON_noka --log-file logs/scrape.log
 ```
 
@@ -133,8 +134,11 @@ python scraper.py --out-dir images --reference-dir MEGAFON_noka --log-file logs/
 | オプション | 説明 |
 | --- | --- |
 | `--urls` | 取得元のYahoo検索URLを指定（複数指定可） |
-| `--num-jitters` | 顔エンコードの試行回数。数値を上げると厳密になるが遅くなる（例: 3） |
-| `--max-age-days` | 取得対象の日数。`0` を指定すると全期間対象 |
+| `--num-jitters` | 顔エンコードの試行回数。数値を上げると厳密になるが遅くなる（デフォルト: 5） |
+| `--max-age-days` | 取得対象の日数（デフォルト: 2）。`0` を指定すると全期間対象 |
+| `--tolerance` / `--negative-tolerance` / `--negative-margin` | 本人判定/NG判定のしきい値。デフォルトは顔マッチ0.50 / NG 0.40 / マージン0.05 |
+| `--max-faces` | 1枚あたりの許容顔数（デフォルト: 2。3人以上はスキップ） |
+| `--workers` | 顔エンコード並列数（デフォルト: 2） |
 | `--html-file` | 保存済みHTMLファイルを解析してダウンロード（ローカル解析用） |
 
 ---
@@ -144,17 +148,14 @@ python scraper.py --out-dir images --reference-dir MEGAFON_noka --log-file logs/
 - スケジュール: JST 00 / 06 / 08 / 12 / 16 / 20（UTC 15 / 21 / 23 / 03 / 07 / 11）
 - 内容: `scraper.py` → `bot.py` を1ジョブで実行し、`images/`, `state/history.json`, `state/usage.json` の差分を自動コミット＆push（PR時はコミットしない）。
 - 必須シークレット（リポや環境「.env」に設定）
-- `TWITTER_CONSUMER_KEY`
-- `TWITTER_CONSUMER_SECRET`
-- `TWITTER_ACCESS_TOKEN`
-- `TWITTER_ACCESS_TOKEN_SECRET`
-- 任意: `SAUCENAO_KEY`（逆引きAlt用）
+  - `TWITTER_CONSUMER_KEY`
+  - `TWITTER_CONSUMER_SECRET`
+  - `TWITTER_ACCESS_TOKEN`
+  - `TWITTER_ACCESS_TOKEN_SECRET`
+  - 任意: `SAUCENAO_KEY`（逆引きAlt用）
 - ログ: `logs/` を Artifact として保存。
 
-- 運用ポリシー例:
-  - Fork して main ブランチを自分用に運用するのが前提。
-  - このリポジトリでは実運用中データは `actions` ブランチ側にある場合があります。必要に応じて取得してください（main はベース用）。
-  - 画像をリポに含めるかどうかは運用方針次第です。大きくなる場合は `.gitignore` で除外してください。
+※ Actionsで画像もリポにコミットされるため、リポサイズ増に注意。
 
 ---
 
