@@ -7,3 +7,5 @@ state/*.lock
 images/
 MEGAFON_noka/
 MEGAFON_other/
+evalute.py
+.gitignore
