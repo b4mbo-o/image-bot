@@ -168,6 +168,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_USER_AGENT,
         help="HTTPリクエストのUser-Agent。",
     )
+    parser.add_argument(
+        "--block-list",
+        default="state/block.json",
+        help="保存をスキップする画像のハッシュ/ファイル名を列挙したJSONファイル。",
+    )
     return parser.parse_args()
 
 
@@ -197,6 +202,46 @@ def list_images(images_dir: Path) -> List[Path]:
 
 def compute_digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def load_block_list(path: Path) -> Set[str]:
+    """
+    JSONファイルからブロック対象のダイジェスト接頭辞を読み込む。
+    - リスト形式、もしくは {block: [...]} / {digests: [...]} などの配列を想定。
+    - 要素は sha256 の先頭数文字、あるいは yahoo_rt_xxx.jpg のファイル名でもOK。
+    """
+    blocked: Set[str] = set()
+    if not path:
+        return blocked
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return blocked
+    except Exception:
+        logging.warning("Failed to load block list: %s", path)
+        return blocked
+
+    if isinstance(raw, dict):
+        for key in ("block", "digests", "files", "items"):
+            if key in raw and isinstance(raw[key], (list, tuple, set)):
+                raw = raw[key]
+                break
+
+    if not isinstance(raw, (list, tuple, set)):
+        return blocked
+
+    for entry in raw:
+        if entry is None:
+            continue
+        s = str(entry).strip().lower()
+        if s.startswith(FILENAME_PREFIX + "_"):
+            s = s.split("_", 1)[1]
+        if "." in s:
+            s = s.split(".", 1)[0]
+        s = re.sub(r"[^0-9a-f]", "", s)
+        if s:
+            blocked.add(s)
+    return blocked
 
 
 def deduplicate_images(images_dir: Path) -> None:
@@ -1052,6 +1097,7 @@ def main() -> None:
     )
     existing_hashes = digests_for_existing(out_dir)
     seen_hashes: Set[str] = set(existing_hashes)
+    blocked_digests = load_block_list(Path(args.block_list)) if args.block_list else set()
 
     saved = 0
     new_saved_files: List[Path] = []
@@ -1113,6 +1159,10 @@ def main() -> None:
                 continue
 
             digest = compute_digest(data)
+            if blocked_digests and any(digest.startswith(b) for b in blocked_digests):
+                logging.debug("Skip blocked digest prefix: %s (url=%s)", digest[:12], url)
+                stats["blocked"] += 1
+                continue
             if digest in seen_hashes:
                 logging.debug("Skip duplicate (hash match): %s", url)
                 stats["duplicate_hash"] += 1
@@ -1246,9 +1296,10 @@ def main() -> None:
     removed = remove_near_duplicates(out_dir, new_saved_files)
     stats["near_dup_removed"] += removed
     logging.info(
-        "Summary: saved=%d, near_dup_removed=%d, duplicate_hash=%d, unsupported=%d, download_fail=%d, no_face=%d, too_many_faces=%d, encode_fail=%d, no_match=%d",
+        "Summary: saved=%d, near_dup_removed=%d, blocked=%d, duplicate_hash=%d, unsupported=%d, download_fail=%d, no_face=%d, too_many_faces=%d, encode_fail=%d, no_match=%d",
         stats["saved"],
         stats["near_dup_removed"],
+        stats["blocked"],
         stats["duplicate_hash"],
         stats["unsupported"],
         stats["download_fail"],
