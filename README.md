@@ -140,6 +140,10 @@ python scraper.py --out-dir images --reference-dir MEGAFON_noka --log-file logs/
 | `--max-faces` | 1枚あたりの許容顔数（デフォルト: 2。3人以上はスキップ） |
 | `--workers` | 顔エンコード並列数（デフォルト: 2） |
 | `--html-file` | 保存済みHTMLファイルを解析してダウンロード（ローカル解析用） |
+| `--block-list` | `state/block.json` などに指定したダイジェスト/ファイル名プレフィックスをスキップ |
+
+`--block-list` の例: `{"block": ["yahoo_rt_2f038d67fe16.jpg", "2f038d67fe16"]}`  
+ハッシュ先頭に一致する画像は保存しません。
 
 ---
 
