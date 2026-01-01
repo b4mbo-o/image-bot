@@ -18,6 +18,8 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 DEFAULT_HISTORY_SIZE = 12
 DEFAULT_ENV_FILE = ".env"
 DEFAULT_USAGE_FILE = "state/usage.json"
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BACKOFF_BASE = 2
 
 
 def parse_args() -> argparse.Namespace:
@@ -276,22 +278,61 @@ def run_once(args: argparse.Namespace) -> None:
             logging.info("Dry-run mode: skipping tweet and history update.")
             return
 
-        client, api = build_twitter_clients()
-        tweet_id = upload_and_tweet(client, api, chosen, args.text)
-        logging.info("Tweet posted: id=%s image=%s", tweet_id or "<unknown>", rel_name)
+        try:
+            client, api = build_twitter_clients()
+        except RuntimeError as exc:
+            logging.error("Twitter credentials missing or invalid: %s", exc)
+            # Do not fail the action; log and return.
+            return
 
+        # Attempt posting with retries for transient errors. Treat 403 Forbidden as non-fatal
+        # (log it but do not mark the action as failed). If posting ultimately fails, we skip
+        # updating history/usage so nothing is committed.
+        success = False
+        tweet_id = ""
+        for attempt in range(1, DEFAULT_MAX_RETRIES + 1):
+            try:
+                tweet_id = upload_and_tweet(client, api, chosen, args.text)
+                logging.info("Tweet posted: id=%s image=%s", tweet_id or "<unknown>", rel_name)
+                success = True
+                break
+            except tweepy.errors.Forbidden as e:
+                logging.error("Twitter API returned 403 Forbidden: %s", e)
+                # Log and do not retry; treat as non-fatal for Actions.
+                success = False
+                break
+            except Exception as e:
+                logging.warning("Error posting tweet (attempt %d/%d): %s", attempt, DEFAULT_MAX_RETRIES, e, exc_info=True)
+                if attempt < DEFAULT_MAX_RETRIES:
+                    backoff = DEFAULT_BACKOFF_BASE ** attempt
+                    logging.info("Retrying after %d seconds...", backoff)
+                    time.sleep(backoff)
+                else:
+                    logging.error("Failed to post tweet after %d attempts: %s", DEFAULT_MAX_RETRIES, e, exc_info=True)
+
+        if not success:
+            logging.info("Skipping history/usage update due to failed tweet.")
+            return
+
+        # Only update history/usage on successful posts
         history.append(rel_name)
         trimmed = history[-args.history_size :]
-        save_history(history_file, trimmed)
-        logging.info("History updated; %d entries retained.", len(trimmed))
+        try:
+            save_history(history_file, trimmed)
+            logging.info("History updated; %d entries retained.", len(trimmed))
+        except Exception:
+            logging.exception("Failed to save history; continuing.")
 
         now_ts = time.time()
         usage_entry = usage.get(rel_name) or {"count": 0, "last_used": 0}
         usage_entry["count"] = usage_entry.get("count", 0) + 1
         usage_entry["last_used"] = now_ts
         usage[rel_name] = usage_entry
-        save_usage(usage_file, usage)
-        logging.info("Usage updated; count=%d for %s", usage_entry["count"], rel_name)
+        try:
+            save_usage(usage_file, usage)
+            logging.info("Usage updated; count=%d for %s", usage_entry["count"], rel_name)
+        except Exception:
+            logging.exception("Failed to save usage; continuing.")
 
 
 def main() -> None:
