@@ -18,6 +18,8 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 DEFAULT_HISTORY_SIZE = 12
 DEFAULT_ENV_FILE = ".env"
 DEFAULT_USAGE_FILE = "state/usage.json"
+DEFAULT_POSTS_FILE = "state/posts.json"
+DEFAULT_MIN_IMAGE_AGE_HOURS = 24.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF_BASE = 2
 
@@ -46,6 +48,11 @@ def parse_args() -> argparse.Namespace:
         "--usage-file",
         default=DEFAULT_USAGE_FILE,
         help="Path to store per-image usage counts.",
+    )
+    parser.add_argument(
+        "--posts-file",
+        default=DEFAULT_POSTS_FILE,
+        help="Path to store tweet ID to image mappings.",
     )
     parser.add_argument(
         "--prefer-rare",
@@ -79,6 +86,12 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Do everything except the actual tweet or history update.",
+    )
+    parser.add_argument(
+        "--min-image-age-hours",
+        type=float,
+        default=DEFAULT_MIN_IMAGE_AGE_HOURS,
+        help="Minimum age in hours before a discovered image can be posted.",
     )
     parser.add_argument(
         "--log-file",
@@ -178,11 +191,33 @@ def load_usage(path: Path) -> Dict[str, Dict[str, float]]:
         return {}
 
 
+def load_posts(path: Path) -> Dict[str, Dict[str, object]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        raise ValueError("posts file is malformed")
+    except json.JSONDecodeError:
+        logging.warning("Posts file is empty or invalid JSON; resetting: %s", path)
+        return {}
+
+
 def save_usage(path: Path, usage: Dict[str, Dict[str, float]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(usage, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def save_posts(path: Path, posts: Dict[str, Dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(posts, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, path)
 
 
@@ -205,18 +240,45 @@ def list_images(images_dir: Path) -> List[Path]:
     return sorted(images)
 
 
+def normalize_usage_entry(raw: object) -> Dict[str, float]:
+    entry = {"count": 0, "last_used": 0.0, "first_seen": 0.0}
+    if isinstance(raw, dict):
+        count = raw.get("count", 0)
+        if isinstance(count, (int, float)):
+            entry["count"] = int(count)
+        for key in ("last_used", "first_seen"):
+            value = raw.get(key, entry[key])
+            if isinstance(value, (int, float)):
+                entry[key] = float(value)
+    elif isinstance(raw, (int, float)):
+        entry["count"] = int(raw)
+    return entry
+
+
+def ensure_usage_entries(images: Sequence[Path], usage: Dict[str, Dict[str, float]]) -> bool:
+    changed = False
+    for path in images:
+        normalized = normalize_usage_entry(usage.get(path.name))
+        if usage.get(path.name) != normalized:
+            usage[path.name] = normalized
+            changed = True
+    return changed
+
+
 def select_image(
     images: Sequence[Path],
     recent: Sequence[str],
     history_size: int,
     usage: Dict[str, Dict[str, float]],
     prefer_rare: bool,
+    min_image_age_hours: float,
+    now_ts: float,
 ) -> Path:
     if not images:
         raise RuntimeError("No images found to post.")
 
     history_tail = list(recent)[-history_size:]
-    recent_set = set(history_tail)
+    recent_set = {Path(item).name for item in history_tail}
     eligible = [p for p in images if p.name not in recent_set]
 
     if not eligible:
@@ -225,13 +287,51 @@ def select_image(
         )
         eligible = list(images)
 
+    min_age_seconds = max(0.0, min_image_age_hours) * 3600.0
+    if min_age_seconds > 0:
+        mature = [
+            p
+            for p in eligible
+            if now_ts - normalize_usage_entry(usage.get(p.name)).get("first_seen", 0.0)
+            >= min_age_seconds
+        ]
+        if mature:
+            logging.info(
+                "Eligible images after %.1fh cooldown: %d/%d",
+                min_image_age_hours,
+                len(mature),
+                len(eligible),
+            )
+            eligible = mature
+        else:
+            raise RuntimeError(
+                "No images are old enough to post yet; skipping this run."
+            )
+
     pool = eligible
-    if prefer_rare and usage:
-        min_count = min(usage.get(p.name, {}).get("count", 0) for p in eligible)
-        rare = [p for p in eligible if usage.get(p.name, {}).get("count", 0) == min_count]
+    if prefer_rare:
+        min_count = min(normalize_usage_entry(usage.get(p.name)).get("count", 0.0) for p in eligible)
+        rare = [
+            p
+            for p in eligible
+            if normalize_usage_entry(usage.get(p.name)).get("count", 0.0) == min_count
+        ]
         if rare:
             pool = rare
             logging.info("Prefer rare images: choosing among %d least-used.", len(pool))
+
+    oldest_first_seen = min(
+        normalize_usage_entry(usage.get(p.name)).get("first_seen", 0.0) for p in pool
+    )
+    oldest = [
+        p
+        for p in pool
+        if normalize_usage_entry(usage.get(p.name)).get("first_seen", 0.0)
+        == oldest_first_seen
+    ]
+    if oldest:
+        pool = oldest
+        logging.info("Oldest eligible image bucket size: %d", len(pool))
 
     chosen = random.choice(pool)
     return chosen
@@ -262,25 +362,54 @@ def run_once(args: argparse.Namespace) -> None:
     images_dir = Path(args.images_dir)
     history_file = Path(args.history_file)
     usage_file = Path(args.usage_file)
+    posts_file = Path(args.posts_file)
     lock_file = history_file.with_suffix(history_file.suffix + ".lock")
 
     with file_lock(lock_file):
         history = load_history(history_file)
         usage = load_usage(usage_file)
         images = list_images(images_dir)
+        usage_changed = ensure_usage_entries(images, usage)
         logging.info("Images available in %s: %d", images_dir, len(images))
-        chosen = select_image(images, history, args.history_size, usage, args.prefer_rare)
+        try:
+            chosen = select_image(
+                images,
+                history,
+                args.history_size,
+                usage,
+                args.prefer_rare,
+                args.min_image_age_hours,
+                time.time(),
+            )
+        except RuntimeError as exc:
+            if usage_changed:
+                try:
+                    save_usage(usage_file, usage)
+                except Exception:
+                    logging.exception("Failed to save usage metadata; continuing.")
+            logging.info("%s", exc)
+            return
         rel_name = chosen.relative_to(images_dir).as_posix()
 
         logging.info("Selected image: %s", rel_name)
 
         if args.dry_run:
+            if usage_changed:
+                try:
+                    save_usage(usage_file, usage)
+                except Exception:
+                    logging.exception("Failed to save usage metadata; continuing.")
             logging.info("Dry-run mode: skipping tweet and history update.")
             return
 
         try:
             client, api = build_twitter_clients()
         except RuntimeError as exc:
+            if usage_changed:
+                try:
+                    save_usage(usage_file, usage)
+                except Exception:
+                    logging.exception("Failed to save usage metadata; continuing.")
             logging.error("Twitter credentials missing or invalid: %s", exc)
             # Do not fail the action; log and return.
             return
@@ -311,6 +440,11 @@ def run_once(args: argparse.Namespace) -> None:
                     logging.error("Failed to post tweet after %d attempts: %s", DEFAULT_MAX_RETRIES, e, exc_info=True)
 
         if not success:
+            if usage_changed:
+                try:
+                    save_usage(usage_file, usage)
+                except Exception:
+                    logging.exception("Failed to save usage metadata; continuing.")
             logging.info("Skipping history/usage update due to failed tweet.")
             return
 
@@ -324,7 +458,7 @@ def run_once(args: argparse.Namespace) -> None:
             logging.exception("Failed to save history; continuing.")
 
         now_ts = time.time()
-        usage_entry = usage.get(rel_name) or {"count": 0, "last_used": 0}
+        usage_entry = normalize_usage_entry(usage.get(rel_name))
         usage_entry["count"] = usage_entry.get("count", 0) + 1
         usage_entry["last_used"] = now_ts
         usage[rel_name] = usage_entry
@@ -333,6 +467,15 @@ def run_once(args: argparse.Namespace) -> None:
             logging.info("Usage updated; count=%d for %s", usage_entry["count"], rel_name)
         except Exception:
             logging.exception("Failed to save usage; continuing.")
+
+        if tweet_id:
+            posts = load_posts(posts_file)
+            posts[tweet_id] = {"image": rel_name, "posted_at": now_ts}
+            try:
+                save_posts(posts_file, posts)
+                logging.info("Post mapping updated for tweet=%s", tweet_id)
+            except Exception:
+                logging.exception("Failed to save post mapping; continuing.")
 
 
 def main() -> None:
