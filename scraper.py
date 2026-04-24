@@ -8,6 +8,7 @@ import logging
 import os
 import pickle
 import re
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,12 +23,28 @@ from PIL import Image, ImageOps, ImageEnhance
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 
+try:
+    import pytesseract
+    from pytesseract import Output as TesseractOutput
+except Exception:
+    pytesseract = None
+    TesseractOutput = None
+
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 FILENAME_PREFIX = "yahoo_rt"
 FACE_MODEL = "hog"
 FACE_UPSAMPLE = 1
+OCR_LANG = "jpn+eng"
+POSTER_TEXT_RE = re.compile(
+    r"(open|start|live|ticket|door|adv|present|presents|schedule|vol\.?|women|"
+    r"会場|開場|開演|前売|当日|料金|出演|チケット|女性限定|特典会|入場)"
+)
+DATE_TIME_RE = re.compile(
+    r"(\d{1,2}[:：]\d{2}|\d{4}[./-]\d{1,2}[./-]\d{1,2}|\d{1,2}[./-]\d{1,2}|"
+    r"\d{1,2}月\d{1,2}日)"
+)
 DEFAULT_URLS = [
     "https://search.yahoo.co.jp/realtime/search?p=ID%3AMEGAFON_noka&aq=-1&ei=UTF-8&mtype=image&rkf=1",
     "https://search.yahoo.co.jp/realtime/search?p=ID%3AMEGAFON_idol&aq=-1&ei=UTF-8&mtype=image&rkf=1",
@@ -60,6 +77,11 @@ def parse_args() -> argparse.Namespace:
         "--base-url",
         default="",
         help="--html-file使用時の基点URL。",
+    )
+    parser.add_argument(
+        "--usage-file",
+        default="state/usage.json",
+        help="Path to usage metadata that stores first_seen timestamps.",
     )
     parser.add_argument(
         "--out-dir",
@@ -173,6 +195,31 @@ def parse_args() -> argparse.Namespace:
         default="state/block.json",
         help="保存をスキップする画像のハッシュ/ファイル名を列挙したJSONファイル。",
     )
+    parser.add_argument(
+        "--no-ocr",
+        dest="ocr_enabled",
+        action="store_false",
+        help="Disable OCR-based event-poster rejection.",
+    )
+    parser.set_defaults(ocr_enabled=True)
+    parser.add_argument(
+        "--ocr-min-text-items",
+        type=int,
+        default=8,
+        help="Minimum OCR token count before poster heuristics engage.",
+    )
+    parser.add_argument(
+        "--ocr-min-text-chars",
+        type=int,
+        default=24,
+        help="Minimum OCR character count for poster rejection.",
+    )
+    parser.add_argument(
+        "--ocr-min-text-area",
+        type=float,
+        default=0.12,
+        help="Minimum OCR box area ratio for poster rejection.",
+    )
     return parser.parse_args()
 
 
@@ -204,6 +251,58 @@ def compute_digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def load_usage_state(path: Path) -> Dict[str, Dict[str, float]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        logging.warning("Usage file is empty or invalid JSON; resetting: %s", path)
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    logging.warning("Usage file is malformed: %s", path)
+    return {}
+
+
+def save_usage_state(path: Path, usage: Dict[str, Dict[str, float]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(usage, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def normalize_usage_entry(raw: object) -> Dict[str, float]:
+    entry = {"count": 0, "last_used": 0.0, "first_seen": 0.0}
+    if isinstance(raw, dict):
+        count = raw.get("count", 0)
+        if isinstance(count, (int, float)):
+            entry["count"] = int(count)
+        for key in ("last_used", "first_seen"):
+            value = raw.get(key, entry[key])
+            if isinstance(value, (int, float)):
+                entry[key] = float(value)
+    elif isinstance(raw, (int, float)):
+        entry["count"] = int(raw)
+    return entry
+
+
+def ensure_usage_entry(
+    usage: Dict[str, Dict[str, float]],
+    image_name: str,
+    first_seen_ts: float,
+) -> bool:
+    entry = normalize_usage_entry(usage.get(image_name))
+    changed = usage.get(image_name) != entry
+    if entry["first_seen"] <= 0:
+        entry["first_seen"] = first_seen_ts
+        changed = True
+    if changed:
+        usage[image_name] = entry
+    return changed
+
+
 def load_block_list(path: Path) -> Set[str]:
     """
     JSONファイルからブロック対象のダイジェスト接頭辞を読み込む。
@@ -214,12 +313,16 @@ def load_block_list(path: Path) -> Set[str]:
     if not path:
         return blocked
     try:
-        raw = json.loads(path.read_text())
+        raw_text = path.read_text(encoding="utf-8")
+        raw = json.loads(raw_text)
     except FileNotFoundError:
         return blocked
     except Exception:
         logging.warning("Failed to load block list: %s", path)
-        return blocked
+        raw = re.findall(
+            rf"{re.escape(FILENAME_PREFIX)}_[0-9a-fA-F]+|[0-9a-fA-F]{{8,64}}",
+            path.read_text(encoding="utf-8", errors="ignore"),
+        )
 
     if isinstance(raw, dict):
         for key in ("block", "digests", "files", "items"):
@@ -756,6 +859,168 @@ def determine_extension(data: bytes) -> Optional[str]:
     return None
 
 
+def _prepare_ocr_image(pil_img: Image.Image) -> Image.Image:
+    img = ImageOps.autocontrast(pil_img.convert("L"))
+    max_dim = max(img.size)
+    if max_dim < 1400:
+        scale = 1400.0 / max_dim
+        img = img.resize(
+            (int(img.size[0] * scale), int(img.size[1] * scale)),
+            Image.LANCZOS,
+        )
+    return img
+
+
+def detect_poster_text(
+    pil_img: Image.Image,
+    min_text_items: int,
+    min_text_chars: int,
+    min_text_area: float,
+) -> Tuple[bool, Dict[str, Any]]:
+    details: Dict[str, Any] = {
+        "available": bool(pytesseract and TesseractOutput),
+        "token_count": 0,
+        "char_count": 0,
+        "text_area_ratio": 0.0,
+        "keyword_hits": 0,
+        "datetime_hits": 0,
+    }
+    if not pytesseract or not TesseractOutput:
+        return False, details
+
+    img = _prepare_ocr_image(pil_img)
+    try:
+        data = pytesseract.image_to_data(
+            img,
+            lang=OCR_LANG,
+            config="--oem 3 --psm 6",
+            output_type=TesseractOutput.DICT,
+        )
+    except Exception:
+        try:
+            data = pytesseract.image_to_data(
+                img,
+                lang="eng",
+                config="--oem 3 --psm 6",
+                output_type=TesseractOutput.DICT,
+            )
+        except Exception:
+            return False, details
+
+    tokens: List[str] = []
+    text_area = 0
+    width = max(1, img.size[0])
+    height = max(1, img.size[1])
+    confidences = data.get("conf") or []
+    for idx, raw_text in enumerate(data.get("text") or []):
+        token = str(raw_text or "").strip()
+        if not token:
+            continue
+        conf_raw = confidences[idx] if idx < len(confidences) else "-1"
+        try:
+            conf = float(conf_raw)
+        except Exception:
+            conf = -1.0
+        if conf < 25 and not re.search(r"\d", token):
+            continue
+        tokens.append(token)
+        try:
+            box_w = max(0, int(data["width"][idx]))
+            box_h = max(0, int(data["height"][idx]))
+            text_area += box_w * box_h
+        except Exception:
+            pass
+
+    joined = " ".join(tokens).lower()
+    details["token_count"] = len(tokens)
+    details["char_count"] = sum(len(re.sub(r"\s+", "", token)) for token in tokens)
+    details["text_area_ratio"] = min(1.0, text_area / float(width * height))
+    details["keyword_hits"] = len(POSTER_TEXT_RE.findall(joined))
+    details["datetime_hits"] = len(DATE_TIME_RE.findall(joined))
+
+    poster_like = False
+    if details["text_area_ratio"] >= min_text_area and (
+        details["char_count"] >= min_text_chars or details["keyword_hits"] >= 1
+    ):
+        poster_like = True
+    elif details["token_count"] >= min_text_items and (
+        details["keyword_hits"] >= 1 or details["datetime_hits"] >= 2
+    ):
+        poster_like = True
+    elif details["keyword_hits"] >= 2 and (
+        details["datetime_hits"] >= 1 or details["char_count"] >= min_text_chars
+    ):
+        poster_like = True
+
+    return poster_like, details
+
+
+def mean_smallest_distances(values: Sequence[float], count: int) -> float:
+    if not values:
+        return float("inf")
+    limit = max(1, min(int(count), len(values)))
+    arr = np.asarray(values, dtype=float)
+    smallest = np.partition(arr, limit - 1)[:limit]
+    return float(np.mean(smallest))
+
+
+def _face_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    top = max(a[0], b[0])
+    right = min(a[1], b[1])
+    bottom = min(a[2], b[2])
+    left = max(a[3], b[3])
+    if right <= left or bottom <= top:
+        return 0.0
+    intersection = (right - left) * (bottom - top)
+    area_a = max(1, (a[1] - a[3]) * (a[2] - a[0]))
+    area_b = max(1, (b[1] - b[3]) * (b[2] - b[0]))
+    return intersection / float(area_a + area_b - intersection)
+
+
+def dedupe_face_locations(
+    locations: Sequence[Tuple[int, int, int, int]]
+) -> List[Tuple[int, int, int, int]]:
+    unique: List[Tuple[int, int, int, int]] = []
+    for loc in locations:
+        if any(_face_iou(loc, existing) >= 0.35 for existing in unique):
+            continue
+        unique.append(loc)
+    return unique
+
+
+def detect_faces_tiled(
+    pil_img: Image.Image,
+    model: str,
+    base_upsample: int,
+) -> List[Tuple[int, int, int, int]]:
+    width, height = pil_img.size
+    if max(width, height) < 900:
+        return []
+
+    tile_w = min(width, max(640, int(width * 0.72)))
+    tile_h = min(height, max(640, int(height * 0.72)))
+    x_positions = sorted({0, max(0, width - tile_w)})
+    y_positions = sorted({0, max(0, height - tile_h)})
+
+    all_locations: List[Tuple[int, int, int, int]] = []
+    for left in x_positions:
+        for top in y_positions:
+            tile = pil_img.crop((left, top, left + tile_w, top + tile_h))
+            arr = np.array(ImageOps.autocontrast(tile).convert("RGB"))
+            try:
+                tile_locations = face_recognition.face_locations(
+                    arr,
+                    model=model,
+                    number_of_times_to_upsample=max(1, base_upsample),
+                )
+            except Exception:
+                continue
+            for t, r, b, l in tile_locations:
+                all_locations.append((t + top, r + left, b + top, l + left))
+
+    return dedupe_face_locations(all_locations)
+
+
 def detect_faces_robust(
     pil_img: Image.Image,
     model: str,
@@ -839,7 +1104,7 @@ def detect_faces_robust(
     return [], arr_std, "failed"
 
 
-def filter_image(
+def _filter_image_legacy(
     data: bytes,
     known_encodings: Sequence,
     negative_encodings: Sequence,
@@ -1052,6 +1317,259 @@ def filter_image(
     return False, reason, {}
 
 
+def filter_image(
+    data: bytes,
+    known_encodings: Sequence,
+    negative_encodings: Sequence,
+    tolerance: float,
+    negative_tolerance: float,
+    negative_margin: float,
+    max_faces: int,
+    num_jitters: int,
+    enforce_two_faces: bool,
+    detect_upsample: int,
+    ocr_enabled: bool,
+    ocr_min_text_items: int,
+    ocr_min_text_chars: int,
+    ocr_min_text_area: float,
+    match_profile: str,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    try:
+        pil_img = Image.fromarray(face_recognition.load_image_file(io.BytesIO(data))).convert("RGB")
+    except Exception:
+        return False, "load_error", {}
+
+    if ocr_enabled:
+        poster_like, poster_details = detect_poster_text(
+            pil_img,
+            ocr_min_text_items,
+            ocr_min_text_chars,
+            ocr_min_text_area,
+        )
+        if poster_like:
+            logging.debug("Rejected poster-like image via OCR: %s", poster_details)
+            return False, "poster_text", poster_details
+
+    locations, image_array, method = detect_faces_robust(pil_img, FACE_MODEL, detect_upsample)
+
+    if FACE_MODEL == "hog" and len(locations) == 2:
+        logging.debug("HOG found 2 faces. Switching to CNN for better accuracy...")
+        try:
+            h, w = image_array.shape[:2]
+            max_dim = max(h, w)
+            cnn_input = image_array
+            scale_factor = 1.0
+            if max_dim > 1200:
+                scale_factor = 1200.0 / max_dim
+                new_w = int(w * scale_factor)
+                new_h = int(h * scale_factor)
+                cnn_input = np.array(Image.fromarray(image_array).resize((new_w, new_h), Image.LANCZOS))
+                logging.debug("Resized for CNN: %dx%d -> %dx%d", w, h, new_w, new_h)
+
+            cnn_locs = face_recognition.face_locations(
+                cnn_input, model="cnn", number_of_times_to_upsample=0
+            )
+            if cnn_locs:
+                if scale_factor != 1.0:
+                    scaled_locs = []
+                    for top, right, bottom, left in cnn_locs:
+                        scaled_locs.append(
+                            (
+                                int(top / scale_factor),
+                                int(right / scale_factor),
+                                int(bottom / scale_factor),
+                                int(left / scale_factor),
+                            )
+                        )
+                    locations = scaled_locs
+                else:
+                    locations = cnn_locs
+                method += "+cnn_switch"
+                logging.debug("CNN switch successful. Found %d faces.", len(locations))
+            else:
+                logging.debug("CNN found no faces. Keeping HOG results.")
+        except Exception as exc:
+            logging.debug("CNN switch failed (err=%s). Keeping HOG results.", exc)
+
+    def validate_faces(current_locs, current_img, encs=None):
+        details = {
+            "score": 9.99,
+            "neg_score": 9.99,
+            "support_score": 9.99,
+            "face_count": len(current_locs),
+            "method": method,
+            "profile": match_profile,
+        }
+        if not current_locs:
+            return False, "no_face", False, details
+
+        if len(current_locs) > max_faces:
+            return False, "too_many_faces", False, details
+
+        if enforce_two_faces and len(current_locs) != 2:
+            return False, "too_many_faces", False, details
+
+        if encs is None:
+            try:
+                encs = face_recognition.face_encodings(
+                    current_img, current_locs, num_jitters=num_jitters
+                )
+            except Exception:
+                return False, "encode_fail", False, details
+
+        if not encs:
+            return False, "encode_fail", False, details
+
+        has_valid_face = False
+        retry_candidate = False
+        global_best_score = float("inf")
+        global_best_neg = float("inf")
+        global_best_support = float("inf")
+        strong_match_threshold = 0.27
+        strong_match_neg_diff = 0.04
+
+        for cand in encs:
+            dists = face_recognition.face_distance(known_encodings, cand)
+            if len(dists) == 0:
+                continue
+            score = min(dists)
+            global_best_score = min(global_best_score, score)
+            support_score = mean_smallest_distances(dists, 3)
+            global_best_support = min(global_best_support, support_score)
+
+            neg_score = float("inf")
+            if negative_encodings:
+                neg_dists = face_recognition.face_distance(negative_encodings, cand)
+                if len(neg_dists) > 0:
+                    neg_score = min(neg_dists)
+                global_best_neg = min(global_best_neg, neg_score)
+
+            if score > tolerance:
+                continue
+
+            if score <= strong_match_threshold:
+                if negative_encodings and neg_score < (score - strong_match_neg_diff):
+                    logging.debug(
+                        "Rejected Strong Match: closer to negative (score=%.3f, neg=%.3f)",
+                        score,
+                        neg_score,
+                    )
+                    retry_candidate = True
+                else:
+                    logging.debug("Found valid face (Strong Match): score=%.3f", score)
+                    has_valid_face = True
+                    break
+
+            if match_profile == "noka" and len(dists) >= 3 and score > 0.30:
+                support_threshold = min(0.47, tolerance - 0.03)
+                if support_score > support_threshold:
+                    logging.debug(
+                        "Rejected noka candidate: weak support cluster (score=%.3f, support=%.3f, threshold=%.3f)",
+                        score,
+                        support_score,
+                        support_threshold,
+                    )
+                    retry_candidate = True
+                    continue
+
+            is_negative = False
+            if negative_tolerance > 0 and neg_score <= negative_tolerance:
+                if score >= neg_score - negative_margin:
+                    is_negative = True
+
+            if (
+                match_profile == "noka"
+                and negative_encodings
+                and score > strong_match_threshold
+                and neg_score < float("inf")
+            ):
+                min_gap = max(negative_margin, 0.035)
+                if neg_score <= score + min_gap:
+                    is_negative = True
+
+            if neg_score < score:
+                is_negative = True
+
+            if not is_negative:
+                logging.debug("Found valid face: score=%.3f, neg=%.3f", score, neg_score)
+                has_valid_face = True
+                break
+
+            retry_candidate = True
+
+        details["score"] = global_best_score
+        details["neg_score"] = global_best_neg
+        details["support_score"] = global_best_support
+
+        if has_valid_face:
+            return True, "ok", False, details
+
+        if global_best_score > tolerance:
+            logging.debug(
+                "Rejected: best match %.3f > tolerance %.3f",
+                global_best_score,
+                tolerance,
+            )
+            return False, "no_match", False, details
+
+        logging.debug(
+            "Rejected: ambiguous or negative match (score=%.3f, neg=%.3f)",
+            global_best_score,
+            global_best_neg,
+        )
+        return False, "negative_match", retry_candidate, details
+
+    ok, reason, needs_retry, _ = validate_faces(locations, image_array)
+    if ok:
+        return True, reason, {}
+
+    if needs_retry and "cnn" not in method and FACE_MODEL == "hog":
+        logging.debug("HOG results ambiguous (potential match rejected). Retrying with CNN...")
+        try:
+            h, w = image_array.shape[:2]
+            max_dim = max(h, w)
+            cnn_input = image_array
+            scale_factor = 1.0
+            if max_dim > 1200:
+                scale_factor = 1200.0 / max_dim
+                new_w = int(w * scale_factor)
+                new_h = int(h * scale_factor)
+                cnn_input = np.array(Image.fromarray(image_array).resize((new_w, new_h), Image.LANCZOS))
+
+            cnn_locs = face_recognition.face_locations(
+                cnn_input, model="cnn", number_of_times_to_upsample=0
+            )
+            if cnn_locs:
+                if scale_factor != 1.0:
+                    scaled_locs = []
+                    for top, right, bottom, left in cnn_locs:
+                        scaled_locs.append(
+                            (
+                                int(top / scale_factor),
+                                int(right / scale_factor),
+                                int(bottom / scale_factor),
+                                int(left / scale_factor),
+                            )
+                        )
+                    locations = scaled_locs
+                else:
+                    locations = cnn_locs
+
+                ok_retry, reason_retry, _, _ = validate_faces(locations, image_array)
+                if ok_retry:
+                    logging.debug("CNN retry successful!")
+                    return True, "ok", {}
+
+                logging.debug("CNN retry result: %s", reason_retry)
+                return False, reason_retry, {}
+
+            logging.debug("CNN found no faces during retry.")
+        except Exception as exc:
+            logging.debug("CNN retry crashed: %s", exc)
+
+    return False, reason, {}
+
+
 def download_image(url: str, timeout: float, user_agent: str) -> bytes:
     resp = requests.get(url, headers={"User-Agent": user_agent}, timeout=timeout)
     resp.raise_for_status()
@@ -1072,6 +1590,12 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     ref_dir = Path(args.reference_dir)
     neg_dir = Path(args.negative_dir) if args.negative_dir else None
+    usage_file = Path(args.usage_file)
+    usage_state = load_usage_state(usage_file)
+    usage_changed = False
+
+    if args.ocr_enabled and not pytesseract:
+        logging.warning("OCR requested but pytesseract is unavailable; poster filtering is disabled.")
 
     ensure_out_dir(out_dir)
     deduplicate_images(out_dir)
@@ -1116,8 +1640,9 @@ def main() -> None:
         neg_margin: float,
         max_faces: int,
         enforce_two_faces: bool,
+        match_profile: str,
     ) -> bool:
-        nonlocal saved
+        nonlocal saved, usage_changed
         # 検出用アップサンプル数の自動調整
         detect_upsample = FACE_UPSAMPLE
         if "のか" in label:
@@ -1186,6 +1711,11 @@ def main() -> None:
                 args.num_jitters,
                 enforce_two_faces,
                 detect_upsample,
+                args.ocr_enabled,
+                args.ocr_min_text_items,
+                args.ocr_min_text_chars,
+                args.ocr_min_text_area,
+                match_profile,
             )
             if not ok:
                 stats[reason] += 1
@@ -1199,6 +1729,8 @@ def main() -> None:
             saved += 1
             stats["saved"] += 1
             logging.info("判定OK [%s] -> %s", label, save_path)
+            if ensure_usage_entry(usage_state, filename, time.time()):
+                usage_changed = True
             new_saved_files.append(save_path)
         
         if hit_old >= 5: # 古い画像が5枚続いたら停止（バッファを持たせる）
@@ -1224,7 +1756,10 @@ def main() -> None:
             args.negative_margin,
             args.max_faces,
             False,
+            "default",
         )
+        if usage_changed:
+            save_usage_state(usage_file, usage_state)
         logging.info("Finished. Saved %d new images.", saved)
         return
 
@@ -1295,14 +1830,23 @@ def main() -> None:
     logging.info("Finished. Saved %d new images.", saved)
     removed = remove_near_duplicates(out_dir, new_saved_files)
     stats["near_dup_removed"] += removed
+    for path in new_saved_files:
+        if path.exists():
+            continue
+        if path.name in usage_state:
+            usage_state.pop(path.name, None)
+            usage_changed = True
+    if usage_changed:
+        save_usage_state(usage_file, usage_state)
     logging.info(
-        "Summary: saved=%d, near_dup_removed=%d, blocked=%d, duplicate_hash=%d, unsupported=%d, download_fail=%d, no_face=%d, too_many_faces=%d, encode_fail=%d, no_match=%d",
+        "Summary: saved=%d, near_dup_removed=%d, blocked=%d, duplicate_hash=%d, unsupported=%d, download_fail=%d, poster_text=%d, no_face=%d, too_many_faces=%d, encode_fail=%d, no_match=%d",
         stats["saved"],
         stats["near_dup_removed"],
         stats["blocked"],
         stats["duplicate_hash"],
         stats["unsupported"],
         stats["download_fail"],
+        stats["poster_text"],
         stats["no_face"],
         stats["too_many_faces"],
         stats["encode_fail"],
