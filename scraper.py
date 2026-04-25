@@ -314,6 +314,8 @@ def load_block_list(path: Path) -> Set[str]:
         return blocked
     try:
         raw_text = path.read_text(encoding="utf-8")
+        if not raw_text.strip():
+            return blocked
         raw = json.loads(raw_text)
     except FileNotFoundError:
         return blocked
@@ -1768,8 +1770,10 @@ def main() -> None:
         # 本人の基準値（少し甘め）
         base_tolerance = args.tolerance
         base_neg_tol = args.negative_tolerance
+        match_profile = "default"
         
         if "MEGAFON_noka" in source_url:
+            match_profile = "noka"
             source_label = "のか"
             tol = base_tolerance + 0.05  # 本人はさらに甘く (例: 0.50 -> 0.55)
             neg_tol = 0.0 # NG判定なし
@@ -1816,6 +1820,7 @@ def main() -> None:
                 neg_margin,
                 max_faces,
                 enforce_two_faces,
+                match_profile,
             ):
                 break
 
