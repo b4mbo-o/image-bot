@@ -47,10 +47,10 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pip'
-      - name: Install system deps (dlib/face_recognition)
+      - name: Install system deps (dlib/face_recognition + OCR)
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libopenblas-dev liblapack-dev libjpeg-dev
+          sudo apt-get install -y build-essential cmake libopenblas-dev liblapack-dev libjpeg-dev tesseract-ocr tesseract-ocr-jpn
       - name: Install Python deps
         run: pip install --upgrade-strategy only-if-needed -r requirements.txt
       - name: Run scraper and bot
@@ -59,10 +59,13 @@ jobs:
           TWITTER_CONSUMER_SECRET: ${{ secrets.TWITTER_CONSUMER_SECRET }}
           TWITTER_ACCESS_TOKEN: ${{ secrets.TWITTER_ACCESS_TOKEN }}
           TWITTER_ACCESS_TOKEN_SECRET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
+          DELETE_COMMAND_USERS: ${{ secrets.DELETE_COMMAND_USERS }}
           SAUCENAO_KEY: ${{ secrets.SAUCENAO_KEY }}
         run: |
           mkdir -p logs state images
           : > logs/bot.log
+          : > logs/moderation.log
+          python moderate_replies.py --log-file logs/moderation.log
           python scraper.py --out-dir images --reference-dir MEGAFON_noka --log-file logs/scrape.log
           if [ -z "$TWITTER_CONSUMER_KEY" ] || [ -z "$TWITTER_CONSUMER_SECRET" ] || [ -z "$TWITTER_ACCESS_TOKEN" ] || [ -z "$TWITTER_ACCESS_TOKEN_SECRET" ]; then
             echo "Missing Twitter secrets; skipping bot." | tee -a logs/bot.log
@@ -85,8 +88,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           mkdir -p state
-          touch state/history.json state/usage.json
-          git add images state/history.json state/usage.json || true
+          touch state/history.json state/usage.json state/posts.json state/block.json state/moderation.json
+          git add images state/history.json state/usage.json state/posts.json state/block.json state/moderation.json || true
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
