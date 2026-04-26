@@ -1716,8 +1716,13 @@
     "first_seen": 0.0
   },
   "yahoo_rt_caa323e649d6.jpg": {
-    "count": 1,
-    "last_used": 1776963172.4189022,
+    "count": 2,
+    "last_used": 1777218921.399353,
     "first_seen": 0.0
+  },
+  "yahoo_rt_ccc77fe34179.jpg": {
+    "count": 0,
+    "last_used": 0.0,
+    "first_seen": 1777218876.5993807
   }
 }
