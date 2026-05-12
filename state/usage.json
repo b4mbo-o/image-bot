@@ -1588,8 +1588,8 @@
     "first_seen": 0.0
   },
   "yahoo_rt_aab2def738ca.jpg": {
-    "count": 2,
-    "last_used": 1773661466.4321377,
+    "count": 3,
+    "last_used": 1778606648.3721015,
     "first_seen": 0.0
   },
   "yahoo_rt_9d40e85f7396.jpg": {
@@ -1759,5 +1759,15 @@
     "count": 1,
     "last_used": 1778507527.1875572,
     "first_seen": 1778413967.385311
+  },
+  "yahoo_rt_dbdba4122bb9.jpg": {
+    "count": 0,
+    "last_used": 0.0,
+    "first_seen": 1778606561.1067426
+  },
+  "yahoo_rt_ec84adbd1590.jpg": {
+    "count": 0,
+    "last_used": 0.0,
+    "first_seen": 1778606563.2086701
   }
 }
