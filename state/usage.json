@@ -1706,8 +1706,8 @@
     "first_seen": 0.0
   },
   "yahoo_rt_a77b50e0d382.jpg": {
-    "count": 2,
-    "last_used": 1776613703.3524117,
+    "count": 3,
+    "last_used": 1779979254.931103,
     "first_seen": 0.0
   },
   "yahoo_rt_47259202e0b4.jpg": {
@@ -1834,5 +1834,10 @@
     "count": 1,
     "last_used": 1779905234.006969,
     "first_seen": 1779818539.9519773
+  },
+  "yahoo_rt_b41a85b7c78a.jpg": {
+    "count": 0,
+    "last_used": 0.0,
+    "first_seen": 1779979230.2843945
   }
 }
