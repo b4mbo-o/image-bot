@@ -1405,8 +1405,8 @@
     "first_seen": 0.0
   },
   "1992560150960619758_1.jpg": {
-    "count": 2,
-    "last_used": 1772574095.4197645,
+    "count": 3,
+    "last_used": 1781958714.2164114,
     "first_seen": 0.0
   },
   "1926968550532551118_1.jpg": {
@@ -1909,5 +1909,15 @@
     "count": 1,
     "last_used": 1781950397.1397052,
     "first_seen": 1781858537.713953
+  },
+  "yahoo_rt_b71e853ecf90.jpg": {
+    "count": 0,
+    "last_used": 0.0,
+    "first_seen": 1781958637.8759458
+  },
+  "yahoo_rt_698a981f11dc.jpg": {
+    "count": 0,
+    "last_used": 0.0,
+    "first_seen": 1781958639.8278155
   }
 }
