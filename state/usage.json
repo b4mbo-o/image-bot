@@ -1936,8 +1936,13 @@
     "first_seen": 1782552716.6305437
   },
   "yahoo_rt_d1935cc79565.jpg": {
+    "count": 1,
+    "last_used": 1783268387.0080185,
+    "first_seen": 1783181595.4793298
+  },
+  "yahoo_rt_0bf42f96b225.jpg": {
     "count": 0,
     "last_used": 0.0,
-    "first_seen": 1783181595.4793298
+    "first_seen": 1783268348.3967302
   }
 }
